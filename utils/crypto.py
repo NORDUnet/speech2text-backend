@@ -15,13 +15,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import os
 import struct
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from typing import Iterator, Optional, Tuple
+from typing import BinaryIO, Iterator, Optional, Tuple
+
+FILE_MAGIC_V2 = b"S2TE2"
 
 
 def generate_rsa_keypair(
@@ -233,31 +236,80 @@ def encrypt_data_to_file(
     chunk_size: int = 1024 * 1024,
 ) -> None:
     """
-    Split a buffer into chunks and encrypt each chunk using encrypt_string().
+    Encrypt bytes to disk using the compact v2 binary file format.
 
-    Parameters:
-        public_key (rsa.RSAPublicKey): The RSA public key for encrypting the AES key.
-        input_bytes (bytes): The binary data to encrypt.
-        output_filepath (str): The path to the output encrypted file.
-        chunk_size (int): The size of each chunk in bytes. Default is 1MB.
+    This function keeps the old public API for callers that already have bytes
+    in memory, but it no longer uses encrypt_string() for file contents.
 
-    Returns:
-        None
+    Old behavior expanded files by roughly 4x because it did:
+
+        binary -> hex -> AES -> hex text
+
+    New behavior encrypts binary chunks directly with AES-GCM and RSA-wraps the
+    AES key once per file.
+    """
+
+    encrypt_stream_to_file(
+        public_key=public_key,
+        input_stream=io.BytesIO(input_bytes),
+        output_filepath=output_filepath,
+        chunk_size=chunk_size,
+    )
+
+
+def encrypt_stream_to_file(
+    public_key: rsa.RSAPublicKey,
+    input_stream: BinaryIO,
+    output_filepath: str,
+    chunk_size: int = 1024 * 1024,
+) -> None:
+    """
+    Stream-encrypt binary data to disk using compact v2 file encryption.
+
+    This avoids:
+    - loading the whole uploaded file into memory
+    - converting file bytes to hex
+    - RSA-encrypting the AES key once per chunk
     """
 
     aes_key = AESGCM.generate_key(bit_length=256)
     aesgcm = AESGCM(aes_key)
-    input_len = len(input_bytes)
+
+    encrypted_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    total_plaintext_size = 0
 
     with open(output_filepath, "wb") as fout:
-        fout.write(struct.pack(">Q", input_len))
+        # Placeholder. Updated after all chunks have been streamed.
+        fout.write(struct.pack(">Q", 0))
 
-        for i in range(0, input_len, chunk_size):
-            chunk = input_bytes[i : i + chunk_size]
-            encrypted_text = encrypt_string(public_key, chunk.hex(), aes_key, aesgcm)
-            encoded = encrypted_text.encode("utf-8")
-            fout.write(struct.pack(">I", len(encoded)))
-            fout.write(encoded)
+        fout.write(FILE_MAGIC_V2)
+        fout.write(struct.pack(">H", len(encrypted_key)))
+        fout.write(encrypted_key)
+
+        while True:
+            chunk = input_stream.read(chunk_size)
+            if not chunk:
+                break
+
+            total_plaintext_size += len(chunk)
+
+            nonce = os.urandom(12)
+            ciphertext = aesgcm.encrypt(nonce, chunk, None)
+            payload = nonce + ciphertext
+
+            fout.write(struct.pack(">I", len(payload)))
+            fout.write(payload)
+
+        fout.seek(0)
+        fout.write(struct.pack(">Q", total_plaintext_size))
 
 
 def decrypt_data_from_file(
@@ -267,44 +319,174 @@ def decrypt_data_from_file(
     end_chunk: Optional[int] = None,
 ) -> Iterator[bytes]:
     """
-    Decrypt a file encrypted by encrypt_data_to_file().
-    Yields binary chunks.
+    Decrypt a file encrypted by either:
+
+    - old v1 format from encrypt_data_to_file()
+      The old format stores each chunk as a UTF-8 encoded hex string created by
+      encrypt_string(public_key, chunk.hex(), ...).
+
+    - new v2 format from encrypt_stream_to_file()
+      The new format stores binary AES-GCM chunks and wraps the AES key once per file.
+
+    Yields plaintext binary chunks.
+    """
+
+    with open(input_filepath, "rb") as fin:
+        original_size_bytes = fin.read(8)
+        if len(original_size_bytes) != 8:
+            raise ValueError("Unexpected end of file while reading original file size")
+
+        marker = fin.read(len(FILE_MAGIC_V2))
+
+        if marker == FILE_MAGIC_V2:
+            yield from _decrypt_data_from_file_v2(
+                private_key=private_key,
+                fin=fin,
+                start_chunk=start_chunk,
+                end_chunk=end_chunk,
+            )
+        else:
+            # Old files do not have a magic marker. Rewind to right after the
+            # original 8-byte plaintext size and parse using the old format.
+            fin.seek(8)
+
+            yield from _decrypt_data_from_file_v1(
+                private_key=private_key,
+                fin=fin,
+                start_chunk=start_chunk,
+                end_chunk=end_chunk,
+            )
+
+
+def _decrypt_data_from_file_v1(
+    private_key: rsa.RSAPrivateKey,
+    fin: BinaryIO,
+    start_chunk: int = 0,
+    end_chunk: Optional[int] = None,
+) -> Iterator[bytes]:
+    """
+    Decrypt old v1 encrypted files.
+
+    Old v1 chunk format after the 8-byte original size header:
+
+        repeated chunks:
+            4 bytes: encrypted text length
+            N bytes: UTF-8 encoded hex string from encrypt_string(...)
+
+    This fallback keeps already encrypted files readable.
     """
 
     chunk_index = 0
 
-    with open(input_filepath, "rb") as fin:
-        fin.read(8)
+    while chunk_index < start_chunk:
+        length_bytes = fin.read(4)
+        if not length_bytes:
+            return
 
-        # Skip to start_chunk more efficiently
-        while chunk_index < start_chunk:
-            length_bytes = fin.read(4)
-            if not length_bytes:
-                return  # File doesn't have enough chunks
-            
-            (chunk_length,) = struct.unpack(">I", length_bytes)
-            fin.seek(chunk_length, 1)  # Seek forward instead of reading
+        if len(length_bytes) != 4:
+            raise ValueError("Unexpected end of file while reading encrypted chunk length")
+
+        (chunk_length,) = struct.unpack(">I", length_bytes)
+        fin.seek(chunk_length, 1)
+        chunk_index += 1
+
+    while True:
+        length_bytes = fin.read(4)
+        if not length_bytes:
+            break
+
+        if len(length_bytes) != 4:
+            raise ValueError("Unexpected end of file while reading encrypted chunk length")
+
+        (chunk_length,) = struct.unpack(">I", length_bytes)
+        encrypted_chunk = fin.read(chunk_length)
+
+        if len(encrypted_chunk) != chunk_length:
+            raise ValueError("Unexpected end of file while reading encrypted chunk")
+
+        if end_chunk is not None and chunk_index > end_chunk:
+            break
+
+        encrypted_text = encrypted_chunk.decode("utf-8")
+        decrypted_hex = decrypt_string(private_key, encrypted_text)
+
+        yield bytes.fromhex(decrypted_hex)
+
+        chunk_index += 1
+
+def _decrypt_data_from_file_v2(
+    private_key: rsa.RSAPrivateKey,
+    fin: BinaryIO,
+    start_chunk: int = 0,
+    end_chunk: Optional[int] = None,
+) -> Iterator[bytes]:
+    """
+    Decrypt new compact v2 encrypted files.
+
+    v2 format after the 8-byte original size header and FILE_MAGIC_V2 marker:
+
+        2 bytes: RSA-encrypted AES key length
+        N bytes: RSA-encrypted AES key
+        repeated chunks:
+            4 bytes: payload length
+            payload:
+                12 bytes: AES-GCM nonce
+                remaining bytes: AES-GCM ciphertext including tag
+    """
+
+    key_length_bytes = fin.read(2)
+    if len(key_length_bytes) != 2:
+        raise ValueError("Unexpected end of file while reading encrypted key length")
+
+    (encrypted_key_length,) = struct.unpack(">H", key_length_bytes)
+
+    encrypted_key = fin.read(encrypted_key_length)
+    if len(encrypted_key) != encrypted_key_length:
+        raise ValueError("Unexpected end of file while reading encrypted key")
+
+    aes_key = private_key.decrypt(
+        encrypted_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    aesgcm = AESGCM(aes_key)
+    chunk_index = 0
+
+    while True:
+        length_bytes = fin.read(4)
+        if not length_bytes:
+            break
+
+        if len(length_bytes) != 4:
+            raise ValueError("Unexpected end of file while reading encrypted chunk length")
+
+        (payload_length,) = struct.unpack(">I", length_bytes)
+
+        if chunk_index < start_chunk:
+            fin.seek(payload_length, 1)
             chunk_index += 1
+            continue
 
-        # Now decrypt and yield chunks from start_chunk to end_chunk
-        while True:
-            length_bytes = fin.read(4)
-            if not length_bytes:
-                break
+        if end_chunk is not None and chunk_index > end_chunk:
+            break
 
-            (chunk_length,) = struct.unpack(">I", length_bytes)
-            encrypted_chunk = fin.read(chunk_length)
-            if len(encrypted_chunk) != chunk_length:
-                raise ValueError("Unexpected end of file while reading encrypted chunk")
+        payload = fin.read(payload_length)
+        if len(payload) != payload_length:
+            raise ValueError("Unexpected end of file while reading encrypted chunk")
 
-            if end_chunk is not None and chunk_index > end_chunk:
-                break
+        if len(payload) < 13:
+            raise ValueError("Encrypted chunk payload is too short")
 
-            encrypted_text = encrypted_chunk.decode("utf-8")
-            decrypted_hex = decrypt_string(private_key, encrypted_text)
-            yield bytes.fromhex(decrypted_hex)
+        nonce = payload[:12]
+        ciphertext = payload[12:]
 
-            chunk_index += 1
+        yield aesgcm.decrypt(nonce, ciphertext, None)
+
+        chunk_index += 1
 
 
 def get_encrypted_file_size(
@@ -334,56 +516,75 @@ def get_encrypted_file_actual_size(
     chunk_size: int,
 ) -> int:
     """
-    Get the actual available data size based on chunks present in the encrypted file.
-    This may differ from the declared original size if the file is incomplete.
+    Get the actual available plaintext size based on chunks present in the
+    encrypted file.
 
-    Parameters:
-        input_filepath (str): The path to the encrypted file.
-        chunk_size (int): The size of each decrypted chunk.
+    Supports both:
+    - old v1 hex-heavy encrypted files
+    - new v2 compact binary encrypted files
 
-    Returns:
-        int: The actual available data size in bytes.
+    This function does not decrypt chunks. It counts complete encrypted chunks
+    and calculates the available plaintext size from the original size header
+    and configured plaintext chunk size.
     """
 
     with open(input_filepath, "rb") as fin:
         original_size_bytes = fin.read(8)
         if len(original_size_bytes) != 8:
             return 0
-        
+
         original_size = struct.unpack(">Q", original_size_bytes)[0]
-        
+
+        marker = fin.read(len(FILE_MAGIC_V2))
+
+        if marker == FILE_MAGIC_V2:
+            key_length_bytes = fin.read(2)
+            if len(key_length_bytes) != 2:
+                return 0
+
+            (encrypted_key_length,) = struct.unpack(">H", key_length_bytes)
+            fin.seek(encrypted_key_length, 1)
+        else:
+            # Old v1 format has no magic marker. Go back to right after the
+            # 8-byte original size header.
+            fin.seek(8)
+
         chunk_count = 0
+
         while True:
             length_bytes = fin.read(4)
             if not length_bytes:
                 break
-            
-            (chunk_length,) = struct.unpack(">I", length_bytes)
-            fin.seek(chunk_length, 1)
+
+            if len(length_bytes) != 4:
+                break
+
+            (encrypted_chunk_length,) = struct.unpack(">I", length_bytes)
+
+            current_position = fin.tell()
+            fin.seek(encrypted_chunk_length, 1)
+
+            # If seeking went beyond EOF, the last chunk is incomplete and should
+            # not be counted.
+            if fin.tell() - current_position != encrypted_chunk_length:
+                break
+
             chunk_count += 1
-        
-        # Calculate actual available size
+
         if chunk_count == 0:
             return 0
-        
-        # Calculate expected total chunks for the original size
+
         expected_total_chunks = (original_size + chunk_size - 1) // chunk_size
-        
+
         if chunk_count >= expected_total_chunks:
-            # File is complete
             return original_size
-        else:
-            # File is incomplete - calculate size based on what we have
-            # All complete chunks are full size
-            complete_chunks = chunk_count - 1
-            
-            # The last chunk size depends on the original file size
-            # We know where the last chunk would fall in the original file
-            last_chunk_original_offset = complete_chunks * chunk_size
-            if last_chunk_original_offset >= original_size:
-                # We only have complete chunks
-                return complete_chunks * chunk_size
-            else:
-                # Calculate what the last chunk's size should be
-                remaining_bytes = min(chunk_size, original_size - last_chunk_original_offset)
-                return complete_chunks * chunk_size + remaining_bytes
+
+        complete_chunks = chunk_count - 1
+        last_chunk_original_offset = complete_chunks * chunk_size
+
+        if last_chunk_original_offset >= original_size:
+            return complete_chunks * chunk_size
+
+        remaining_bytes = min(chunk_size, original_size - last_chunk_original_offset)
+
+        return complete_chunks * chunk_size + remaining_bytes

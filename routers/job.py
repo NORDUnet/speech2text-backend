@@ -44,7 +44,7 @@ from utils.crypto import (
     decrypt_data_from_file,
     deserialize_private_key_from_pem,
     deserialize_public_key_from_pem,
-    encrypt_data_to_file,
+    encrypt_stream_to_file,
     encrypt_string,
 )
 from utils.notifications import notifications
@@ -227,7 +227,7 @@ async def put_video_file(
     if not file_path.exists():
         file_path.mkdir(parents=True, exist_ok=True)
 
-    file_bytes = await file.read()
+    await file.seek(0)
 
     if user_id.isnumeric():
         user_id = (await user_get(username="api_user"))["user_id"]
@@ -235,9 +235,9 @@ async def put_video_file(
     public_key = await user_get_public_key(user_id)
     public_key = deserialize_public_key_from_pem(public_key)
 
-    encrypt_data_to_file(
+    encrypt_stream_to_file(
         public_key,
-        file_bytes,
+        file.file,
         str(file_path / filename),
         chunk_size=settings.CRYPTO_CHUNK_SIZE,
     )
