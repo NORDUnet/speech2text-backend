@@ -42,7 +42,7 @@ from utils.crypto import (
     deserialize_private_key_from_pem,
     encrypt_string,
     decrypt_string,
-    encrypt_stream_to_file,
+    encrypt_async_byte_stream_to_file,
 )
 from utils.log import get_logger
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
@@ -53,6 +53,73 @@ settings = get_settings()
 api_file_storage_dir = settings.API_FILE_STORAGE_DIR
 
 logger = get_logger()
+
+@router.post("/transcriber/stream")
+async def transcribe_file_stream(
+    request: Request,
+    filename: str = Query(...),
+    user: dict = Depends(get_current_user),
+) -> JSONResponse:
+    """
+    Transcribe audio file using a raw streaming upload.
+
+    This avoids FastAPI multipart UploadFile buffering. The request body is
+    encrypted directly while it is being received.
+    """
+
+    user_public_key = await user_get_public_key(user["user_id"])
+    user_public_key = deserialize_public_key_from_pem(user_public_key)
+
+    job = await job_create(
+        user_id=user["user_id"],
+        job_type=JobType.TRANSCRIPTION,
+        filename=encrypt_string(user_public_key, filename),
+    )
+
+    if not (api_user := await user_get(username="api_user")):
+        return JSONResponse(
+            content={"result": {"error": "API user not found"}},
+            status_code=500,
+        )
+
+    public_key = await user_get_public_key(api_user["user_id"])
+    public_key = deserialize_public_key_from_pem(public_key)
+
+    try:
+        file_path = Path(api_file_storage_dir + "/" + user["user_id"])
+        dest_path = file_path / job["uuid"]
+
+        if not file_path.exists():
+            file_path.mkdir(parents=True, exist_ok=True)
+
+        await encrypt_async_byte_stream_to_file(
+            public_key,
+            request.stream(),
+            str(dest_path),
+        )
+
+        job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED)
+
+    except Exception as e:
+        job = await job_update(
+            job["uuid"],
+            user["user_id"],
+            status=JobStatusEnum.FAILED,
+            error=str(e),
+        )
+        return JSONResponse(content={"result": {"error": str(e)}}, status_code=500)
+
+    return JSONResponse(
+        content={
+            "result": {
+                "uuid": job["uuid"],
+                "user_id": user["user_id"],
+                "status": job["status"],
+                "job_type": job["job_type"],
+                "filename": filename,
+            }
+        }
+    )
 
 
 def decrypt_filename(job: dict, private_key) -> dict:
