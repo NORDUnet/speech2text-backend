@@ -192,6 +192,72 @@ def encrypt_string(
 
     return (encrypted_key + nonce + ciphertext).hex()
 
+async def encrypt_async_byte_stream_to_file(
+    public_key: rsa.RSAPublicKey,
+    byte_stream,
+    output_filepath: str,
+    chunk_size: int = 1024 * 1024,
+) -> None:
+    """
+    Encrypt an async byte stream directly to disk using compact v2 file encryption.
+
+    This function keeps plaintext chunks at chunk_size without accumulating the
+    full request body in memory.
+    """
+
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+
+    encrypted_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    total_plaintext_size = 0
+    pending = b""
+
+    def write_encrypted_chunk(fout, plaintext_chunk: bytes) -> None:
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, plaintext_chunk, None)
+
+        fout.write(struct.pack(">I", 12 + len(ciphertext)))
+        fout.write(nonce)
+        fout.write(ciphertext)
+
+    with open(output_filepath, "wb") as fout:
+        fout.write(struct.pack(">Q", 0))
+        fout.write(FILE_MAGIC_V2)
+        fout.write(struct.pack(">H", len(encrypted_key)))
+        fout.write(encrypted_key)
+
+        async for incoming_chunk in byte_stream:
+            if not incoming_chunk:
+                continue
+
+            data = pending + incoming_chunk
+            offset = 0
+            data_length = len(data)
+
+            while data_length - offset >= chunk_size:
+                plaintext_chunk = data[offset : offset + chunk_size]
+                offset += chunk_size
+
+                total_plaintext_size += len(plaintext_chunk)
+                write_encrypted_chunk(fout, plaintext_chunk)
+
+            pending = data[offset:]
+
+        if pending:
+            total_plaintext_size += len(pending)
+            write_encrypted_chunk(fout, pending)
+
+        fout.seek(0)
+        fout.write(struct.pack(">Q", total_plaintext_size))
+
 
 def decrypt_string(
     private_key: rsa.RSAPrivateKey,
