@@ -351,6 +351,7 @@ class Notifications:
                 minutes_included=minutes_included,
                 minutes_consumed=minutes_consumed,
                 remaining_minutes=remaining_minutes,
+                branding_name=settings.BRANDING_NAME,
             ),
         )
 
@@ -387,6 +388,7 @@ class Notifications:
                 quota_minutes=quota_minutes,
                 used_minutes=used_minutes,
                 remaining_minutes=remaining_minutes,
+                branding_name=settings.BRANDING_NAME,
             ),
         )
 
@@ -426,7 +428,9 @@ class Notifications:
 
         self.add(
             to_emails=[to_email],
-            subject=settings.NOTIFICATION_MAIL_WEEKLY_USAGE_REPORT["subject"],
+            subject=settings.NOTIFICATION_MAIL_WEEKLY_USAGE_REPORT["subject"].format(
+                branding_name=settings.BRANDING_NAME,
+            ),
             message=settings.NOTIFICATION_MAIL_WEEKLY_USAGE_REPORT["message"].format(
                 customer_name=customer_name,
                 total_users=total_users,
@@ -438,6 +442,7 @@ class Notifications:
                 minutes_included=minutes_included,
                 remaining_minutes=remaining_minutes,
                 overage_minutes=overage_minutes,
+                branding_name=settings.BRANDING_NAME,
             ),
         )
 
