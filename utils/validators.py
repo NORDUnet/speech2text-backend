@@ -63,6 +63,7 @@ class CreateCustomerRequest(BaseModel):
     support_contact_email: Optional[str] = ""
     notes: Optional[str] = ""
     blocks_purchased: Optional[int] = 0
+    default_transcription_language: Optional[str] = None
 
 
 class UpdateCustomerRequest(BaseModel):
@@ -76,6 +77,7 @@ class UpdateCustomerRequest(BaseModel):
     support_contact_email: Optional[str] = None
     notes: Optional[str] = None
     blocks_purchased: Optional[int] = None
+    default_transcription_language: Optional[str] = None
 
 
 class TranscribeExternalPost(BaseModel):
@@ -145,6 +147,7 @@ class UserUpdateRequest(BaseModel):
     notifications: Optional[NotificationSettings] = None
     reset_password: Optional[bool] = False
     verify_password: Optional[bool] = False
+    default_transcription_language: Optional[str] = None
 
 
 class TranscriptionJobUpdateRequest(BaseModel):

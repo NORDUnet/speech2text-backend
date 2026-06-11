@@ -447,6 +447,7 @@ async def user_update(
     notifications_str: Optional[str] = None,
     email: Optional[str] = None,
     reset_manual: Optional[bool] = False,
+    default_transcription_language: Optional[str] = None,
 ) -> dict:
     """
     Update a user in the database.
@@ -570,6 +571,16 @@ async def user_update(
                 f"Updating notifications for user {user.user_id} to {notifications_str}"
             )
             user.notifications = notifications_str
+
+        if default_transcription_language is not None:
+            log.info(
+                f"Updating default transcription language for user {user.user_id} "
+                f"to {default_transcription_language or '(inherit)'}"
+            )
+            # Empty string clears the override so the realm/customer default applies.
+            user.default_transcription_language = (
+                default_transcription_language or None
+            )
 
         log.info(
             f"User {user.user_id} updated: "

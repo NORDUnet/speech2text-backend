@@ -17,6 +17,7 @@
 
 from auth.oidc import get_current_user
 from db.announcement import announcement_get_active
+from db.customer import customer_get_from_user_id
 from db.user import (
     user_get_private_key,
     user_update,
@@ -34,6 +35,77 @@ router = APIRouter(tags=["user"])
 settings = get_settings()
 
 api_file_storage_dir = settings.API_FILE_STORAGE_DIR
+
+
+# Best-effort guess of a sensible language from a user's home-organisation
+# domain (the realm), used only when neither the user nor their customer has set
+# a default. Keys are country-code TLDs; values must be in
+# SUPPORTED_TRANSCRIPTION_LANGUAGES. Unknown / generic TLDs (.net, .org, .com,
+# .edu, .eu, ...) intentionally have no entry and fall through to the global
+# default.
+REALM_TLD_LANGUAGE: dict[str, str] = {
+    "dk": "Danish",
+    "fi": "Finnish",
+    "se": "Swedish",
+    "no": "Norwegian",
+    "is": "Icelandic",
+    "nl": "Dutch",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "ru": "Russian",
+    "ua": "Ukrainian",
+    "uk": "English",
+    "ie": "English",
+}
+
+
+def _language_from_realm(realm: str | None) -> str | None:
+    """
+    Best-effort transcription language guessed from a realm's country-code TLD.
+
+    Parameters:
+        realm (str | None): The user's realm (home-organisation domain).
+
+    Returns:
+        str | None: A supported language, or None if the TLD is unknown/generic.
+    """
+
+    if not realm:
+        return None
+
+    tld = realm.strip().rstrip(".").rsplit(".", 1)[-1].lower()
+
+    return REALM_TLD_LANGUAGE.get(tld)
+
+
+async def _resolve_default_transcription_language(user: dict) -> str:
+    """
+    Resolve the effective default transcription language for a user.
+
+    Cascade: user override -> customer/admin default -> realm-TLD guess
+    -> system default.
+
+    Parameters:
+        user (dict): The current user.
+
+    Returns:
+        str: The effective default transcription language.
+    """
+
+    if user_default := user.get("default_transcription_language"):
+        return user_default
+
+    customer = await customer_get_from_user_id(user["user_id"])
+    if customer and (customer_default := customer.get("default_transcription_language")):
+        return customer_default
+
+    if realm_default := _language_from_realm(user.get("realm")):
+        return realm_default
+
+    return settings.DEFAULT_TRANSCRIPTION_LANGUAGE
 
 
 @router.get("/me")
@@ -54,6 +126,15 @@ async def get_user_info(
     """
 
     result = dict(user)
+    # Expose the raw user-level override (null when inheriting) so the settings
+    # page can distinguish "use organisation default" from an explicit choice,
+    # and the effective value the transcribe dialogs should preselect.
+    result["user_default_transcription_language"] = result.get(
+        "default_transcription_language"
+    )
+    result["default_transcription_language"] = (
+        await _resolve_default_transcription_language(user)
+    )
     result["announcements"] = await announcement_get_active()
     return JSONResponse(content={"result": result})
 
@@ -128,6 +209,21 @@ async def set_user_info(
             notifications_str += "weekly_report,"
 
         await user_update(user["user_id"], notifications_str=notifications_str)
+
+    elif item.default_transcription_language is not None:
+        language = item.default_transcription_language.strip()
+
+        # An empty value clears the override; any non-empty value must be supported.
+        if language and language not in settings.SUPPORTED_TRANSCRIPTION_LANGUAGES:
+            return JSONResponse(
+                content={"error": "Unsupported transcription language"},
+                status_code=400,
+            )
+
+        await user_update(
+            user["user_id"],
+            default_transcription_language=language,
+        )
 
     return JSONResponse(content={"result": {"status": "OK"}})
 

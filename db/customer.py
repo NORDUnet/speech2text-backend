@@ -44,6 +44,7 @@ async def customer_create(
     support_contact_email: Optional[str] = None,
     notes: Optional[str] = None,
     blocks_purchased: Optional[int] = 0,
+    default_transcription_language: Optional[str] = None,
 ) -> dict:
     """
     Create a new customer in the database.
@@ -76,6 +77,7 @@ async def customer_create(
             realms=realms,
             notes=notes,
             blocks_purchased=blocks_purchased if blocks_purchased else 0,
+            default_transcription_language=default_transcription_language or None,
         )
 
         session.add(customer)
@@ -212,6 +214,7 @@ async def customer_update(
     realms: Optional[str] = None,
     notes: Optional[str] = None,
     blocks_purchased: Optional[int] = None,
+    default_transcription_language: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Update customer metadata.
@@ -260,6 +263,11 @@ async def customer_update(
             customer.notes = notes
         if blocks_purchased is not None:
             customer.blocks_purchased = blocks_purchased
+        if default_transcription_language is not None:
+            # Empty string clears the override so the system default applies.
+            customer.default_transcription_language = (
+                default_transcription_language or None
+            )
 
         log.info(f"Customer {customer.name} (ID: {customer.id}) updated.")
 

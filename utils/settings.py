@@ -83,6 +83,29 @@ class Settings(BaseSettings):
     # Customer config
     CUSTOMER_MINUTES_PER_BLOCK: int = 4000
 
+    # Transcription language configuration.
+    # Ultimate fallback when neither the user nor their realm/customer has set
+    # a default transcription language.
+    DEFAULT_TRANSCRIPTION_LANGUAGE: str = "Finnish"
+    # Languages that may be stored as a user- or customer-level default.
+    # Must stay in sync with WHISPER_LANGUAGES in the frontend.
+    SUPPORTED_TRANSCRIPTION_LANGUAGES: list[str] = [
+        "Swedish",
+        "English",
+        "Norwegian",
+        "Finnish",
+        "Danish",
+        "French",
+        "Spanish",
+        "Portuguese",
+        "German",
+        "Italian",
+        "Dutch",
+        "Russian",
+        "Ukrainian",
+        "Icelandic",
+    ]
+
     # Crypto configuration.
     CRYPTO_KEY_SIZE: int = 4096
     CRYPTO_CHUNK_SIZE: int = (

@@ -16,6 +16,8 @@
 # limitations under the License.
 #
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from db.customer import (
@@ -30,6 +32,7 @@ from db.customer import (
 )
 
 from utils.log import get_logger
+from utils.settings import get_settings
 
 from auth.oidc import get_current_admin_user
 
@@ -40,6 +43,21 @@ from utils.validators import (
 
 log = get_logger()
 router = APIRouter(tags=["admin"])
+settings = get_settings()
+
+
+def _validate_transcription_language(language: Optional[str]) -> bool:
+    """
+    Return True if the language is an acceptable customer default.
+
+    An empty/None value is acceptable (clears the override); any other value
+    must be in the supported list.
+    """
+
+    if not language:
+        return True
+
+    return language in settings.SUPPORTED_TRANSCRIPTION_LANGUAGES
 
 
 @router.get("/admin/customers", include_in_schema=False)
@@ -96,6 +114,11 @@ async def create_customer(
             content={"error": "Missing required fields"}, status_code=400
         )
 
+    if not _validate_transcription_language(item.default_transcription_language):
+        return JSONResponse(
+            content={"error": "Unsupported transcription language"}, status_code=400
+        )
+
     customer = await customer_create(
         customer_abbr=item.customer_abbr,
         partner_id=item.partner_id,
@@ -107,6 +130,7 @@ async def create_customer(
         support_contact_email=item.support_contact_email,
         notes=item.notes,
         blocks_purchased=item.blocks_purchased,
+        default_transcription_language=item.default_transcription_language,
     )
 
     return JSONResponse(content={"result": customer})
@@ -159,6 +183,11 @@ async def update_customer(
         log.warning(f"Non-BOFH user {admin_user['user_id']} denied access to update customer {customer_id}")
         return JSONResponse(content={"error": "User not authorized"}, status_code=403)
 
+    if not _validate_transcription_language(item.default_transcription_language):
+        return JSONResponse(
+            content={"error": "Unsupported transcription language"}, status_code=400
+        )
+
     customer = await customer_update(
         customer_id,
         customer_abbr=item.customer_abbr,
@@ -171,6 +200,7 @@ async def update_customer(
         support_contact_email=item.support_contact_email,
         notes=item.notes,
         blocks_purchased=item.blocks_purchased,
+        default_transcription_language=item.default_transcription_language,
     )
 
     if not customer:

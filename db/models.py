@@ -427,6 +427,10 @@ class User(SQLModel, table=True):
         default=None,
         description="User's notification preferences",
     )
+    default_transcription_language: Optional[str] = Field(
+        default=None,
+        description="User-specific default transcription language; null means inherit from the realm/customer default",
+    )
     deleted: bool = Field(
         default=False,
         description="Indicates if the user has been soft-deleted",
@@ -460,6 +464,7 @@ class User(SQLModel, table=True):
             "manually_activated": self.manually_activated,
             "manually_deactivated": self.manually_deactivated,
             "notifications": self.notifications,
+            "default_transcription_language": self.default_transcription_language,
             "private_key": self.private_key,
             "public_key": self.public_key,
             "realm": self.realm,
@@ -619,6 +624,10 @@ class Customer(SQLModel, table=True):
         default=None,
         description="Support contact email shown to end users in the help dialog",
     )
+    default_transcription_language: Optional[str] = Field(
+        default=None,
+        description="Default transcription language for this customer's realms; null means use the system default",
+    )
     priceplan: PricePlanEnum = Field(
         default=PricePlanEnum.VARIABLE,
         sa_column=Field(sa_column=SQLAlchemyEnum(PricePlanEnum)),
@@ -659,6 +668,7 @@ class Customer(SQLModel, table=True):
             "name": self.name,
             "contact_email": self.contact_email,
             "support_contact_email": self.support_contact_email,
+            "default_transcription_language": self.default_transcription_language,
             "priceplan": self.priceplan,
             "base_fee": self.base_fee if self.base_fee else 0,
             "realms": self.realms,
