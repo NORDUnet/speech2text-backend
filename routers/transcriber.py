@@ -42,7 +42,8 @@ from utils.crypto import (
     deserialize_private_key_from_pem,
     encrypt_string,
     decrypt_string,
-    encrypt_data_to_file,
+    encrypt_stream_to_file,
+    FileTooLargeError,
 )
 from utils.log import get_logger
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
@@ -144,6 +145,18 @@ async def transcribe_file(
         JSONResponse: The job status.
     """
 
+    # Reject oversized uploads before creating a job or reading any body. The
+    # streaming encryptor also enforces this, but the declared Content-Length
+    # lets us fail fast. Allow some slack for multipart framing overhead.
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.MAX_UPLOAD_BYTES + (
+        16 * 1024 * 1024
+    ):
+        return JSONResponse(
+            content={"result": {"error": "File exceeds maximum allowed size"}},
+            status_code=413,
+        )
+
     user_public_key = await user_get_public_key(user["user_id"])
     user_public_key = deserialize_public_key_from_pem(user_public_key)
 
@@ -161,24 +174,39 @@ async def transcribe_file(
     public_key = await user_get_public_key(api_user["user_id"])
     public_key = deserialize_public_key_from_pem(public_key)
 
+    file_path = Path(api_file_storage_dir + "/" + user["user_id"])
+    dest_path = file_path / job["uuid"]
+
+    if not file_path.exists():
+        file_path.mkdir(parents=True, exist_ok=True)
+
     try:
-        file_path = Path(api_file_storage_dir + "/" + user["user_id"])
-        dest_path = file_path / job["uuid"]
-
-        if not file_path.exists():
-            file_path.mkdir(parents=True, exist_ok=True)
-
-        file_bytes = await file.read()
-
-        encrypt_data_to_file(
+        # Stream-encrypt the upload to disk one chunk at a time. The whole file
+        # is never held in RAM, and the size ceiling is enforced as we read.
+        await encrypt_stream_to_file(
             public_key,
-            file_bytes,
-            dest_path,
+            file,
+            str(dest_path),
             chunk_size=settings.CRYPTO_CHUNK_SIZE,
+            max_bytes=settings.MAX_UPLOAD_BYTES,
         )
 
         job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED)
+    except FileTooLargeError:
+        dest_path.unlink(missing_ok=True)
+        job = await job_update(
+            job["uuid"],
+            user["user_id"],
+            status=JobStatusEnum.FAILED,
+            error="File exceeds maximum allowed size",
+        )
+        return JSONResponse(
+            content={"result": {"error": "File exceeds maximum allowed size"}},
+            status_code=413,
+        )
     except Exception as e:
+        # Never leave a partial/corrupt ciphertext behind.
+        dest_path.unlink(missing_ok=True)
         job = await job_update(
             job["uuid"], user["user_id"], status=JobStatusEnum.FAILED, error=str(e)
         )

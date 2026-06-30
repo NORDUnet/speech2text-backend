@@ -15,8 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import struct
+
+import aiofiles
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -258,6 +261,73 @@ def encrypt_data_to_file(
             encoded = encrypted_text.encode("utf-8")
             fout.write(struct.pack(">I", len(encoded)))
             fout.write(encoded)
+
+
+class FileTooLargeError(Exception):
+    """Raised when an upload exceeds the configured maximum size."""
+
+
+async def encrypt_stream_to_file(
+    public_key: rsa.RSAPublicKey,
+    reader,
+    output_filepath: str,
+    chunk_size: int = 1024 * 1024,
+    max_bytes: Optional[int] = None,
+) -> int:
+    """
+    Stream-encrypt data from an async reader to a file using bounded memory.
+
+    Reads one chunk at a time and never holds the whole input in RAM. Produces a
+    file in the exact same format as encrypt_data_to_file() so that
+    decrypt_data_from_file() works unchanged. The original-size header is written
+    as a placeholder up front and backfilled once streaming completes.
+
+    Parameters:
+        public_key (rsa.RSAPublicKey): RSA public key used to wrap the AES key.
+        reader: Any object exposing `async read(size) -> bytes` (e.g. UploadFile).
+        output_filepath (str): Destination path for the encrypted file.
+        chunk_size (int): Plaintext chunk size in bytes. Default 1MB.
+        max_bytes (Optional[int]): If set, abort with FileTooLargeError once the
+            total plaintext read exceeds this many bytes.
+
+    Returns:
+        int: Total plaintext bytes encrypted.
+
+    Raises:
+        FileTooLargeError: If max_bytes is exceeded.
+    """
+
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+    total = 0
+
+    async with aiofiles.open(output_filepath, "wb") as fout:
+        # Placeholder for the u64 original-size header; backfilled at the end.
+        await fout.write(struct.pack(">Q", 0))
+
+        while True:
+            chunk = await reader.read(chunk_size)
+            if not chunk:
+                break
+
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise FileTooLargeError
+
+            # encrypt_string is CPU-bound (RSA wrap + AES); run it off the event
+            # loop so concurrent requests are not blocked during large uploads.
+            encrypted_text = await asyncio.to_thread(
+                encrypt_string, public_key, chunk.hex(), aes_key, aesgcm
+            )
+            encoded = encrypted_text.encode("utf-8")
+
+            await fout.write(struct.pack(">I", len(encoded)))
+            await fout.write(encoded)
+
+        await fout.seek(0)
+        await fout.write(struct.pack(">Q", total))
+
+    return total
 
 
 def decrypt_data_from_file(
