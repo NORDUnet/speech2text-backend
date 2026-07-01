@@ -148,6 +148,7 @@ def acquire_scheduler_lock() -> None:
 # Only mutating/meaningful endpoints are tracked.
 ANALYTICS_ROUTE_MAP = {
     ("POST", f"{settings.API_PREFIX}/transcriber"): "upload",
+    ("POST", f"{settings.API_PREFIX}/transcriber/stream"): "upload",
     ("DELETE", f"{settings.API_PREFIX}/transcriber/{{job_id}}"): "delete_job",
     ("PUT", f"{settings.API_PREFIX}/transcriber/{{job_id}}"): "transcription",
     (
