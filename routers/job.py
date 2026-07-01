@@ -44,7 +44,7 @@ from utils.crypto import (
     decrypt_data_from_file,
     deserialize_private_key_from_pem,
     deserialize_public_key_from_pem,
-    encrypt_data_to_file,
+    encrypt_async_byte_stream_to_file,
     encrypt_string,
 )
 from utils.notifications import notifications
@@ -227,20 +227,36 @@ async def put_video_file(
     if not file_path.exists():
         file_path.mkdir(parents=True, exist_ok=True)
 
-    file_bytes = await file.read()
-
     if user_id.isnumeric():
         user_id = (await user_get(username="api_user"))["user_id"]
 
     public_key = await user_get_public_key(user_id)
     public_key = deserialize_public_key_from_pem(public_key)
 
-    encrypt_data_to_file(
-        public_key,
-        file_bytes,
-        str(file_path / filename),
-        chunk_size=settings.CRYPTO_CHUNK_SIZE,
-    )
+    dest_path = file_path / filename
+
+    async def _uploadfile_chunks():
+        while True:
+            chunk = await file.read(settings.CRYPTO_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+
+    try:
+        # Stream-encrypt one chunk at a time (v2, bounded memory). No size cap:
+        # this is the mTLS worker/Kaltura ingest path, and must keep accepting
+        # the same files it accepted before — only the memory profile changes.
+        # Wire format (multipart PUT) is unchanged, so callers need no changes.
+        await encrypt_async_byte_stream_to_file(
+            public_key,
+            _uploadfile_chunks(),
+            str(dest_path),
+            chunk_size=settings.CRYPTO_CHUNK_SIZE,
+        )
+    except Exception:
+        # Never leave a partial/corrupt ciphertext behind.
+        dest_path.unlink(missing_ok=True)
+        raise
 
     return JSONResponse(
         content={

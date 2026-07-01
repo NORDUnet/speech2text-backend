@@ -65,10 +65,12 @@ from utils.settings import get_settings
 settings = get_settings()
 log = get_logger()
 
-# For the multipart fallback upload endpoint: route Starlette's spool/temp off
-# the small root disk and keep the in-RAM spool threshold low. The streaming
-# endpoint (/transcriber/stream) uses no temp file and is unaffected. The temp
-# dir is provisioned by ops; we only point at it.
+# Multipart uploads (the /transcriber fallback and the mTLS worker/Kaltura
+# PUT /job/{user}/{job}/file) are spooled by Starlette on the way in. Route that
+# spool off the small root disk onto UPLOAD_TMP_DIR and keep the in-RAM threshold
+# low, so the receive phase stays bounded; both handlers then stream from the
+# spool one chunk at a time. The /transcriber/stream endpoint uses
+# request.stream() and no spool at all. The dir is provisioned by ops.
 if settings.UPLOAD_TMP_DIR:
     tempfile.tempdir = settings.UPLOAD_TMP_DIR
 MultiPartParser.spool_max_size = 1024 * 1024 * settings.MULTIPART_SPOOL_MAX_SIZE_MB
