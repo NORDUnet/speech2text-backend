@@ -112,6 +112,16 @@ class Settings(BaseSettings):
         1024 * 1024
     )  # 1MB - must match chunk_size in encrypt_data_to_file
 
+    # Upload handling.
+    # Directory for transient upload spool/temp files (used by the multipart
+    # fallback endpoint). Provisioned by ops; the app does not create it. Empty
+    # = system default temp dir. The streaming endpoint uses no temp file.
+    UPLOAD_TMP_DIR: str = ""
+    # Maximum size of a single uploaded file, in bytes (default 4 GB).
+    MAX_UPLOAD_BYTES: int = 4 * 1024 * 1024 * 1024
+    # In-memory spool threshold (MB) for the multipart fallback endpoint.
+    MULTIPART_SPOOL_MAX_SIZE_MB: int = 8
+
     # E-mail notifications
     NOTIFICATION_MAIL_UPDATED: dict = {
         "subject": "Your e-mail address have been updated",

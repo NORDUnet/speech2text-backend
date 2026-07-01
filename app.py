@@ -27,6 +27,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi_utils.tasks import repeat_every
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.formparsers import MultiPartParser
 
 from auth.oidc import RefreshToken, oauth, verify_token, verify_user
 from db.analytics import log_page_view
@@ -63,6 +64,14 @@ from utils.settings import get_settings
 
 settings = get_settings()
 log = get_logger()
+
+# For the multipart fallback upload endpoint: route Starlette's spool/temp off
+# the small root disk and keep the in-RAM spool threshold low. The streaming
+# endpoint (/transcriber/stream) uses no temp file and is unaffected. The temp
+# dir is provisioned by ops; we only point at it.
+if settings.UPLOAD_TMP_DIR:
+    tempfile.tempdir = settings.UPLOAD_TMP_DIR
+MultiPartParser.spool_max_size = 1024 * 1024 * settings.MULTIPART_SPOOL_MAX_SIZE_MB
 
 scheduler = None
 scheduler_worker = False

@@ -43,6 +43,8 @@ from utils.crypto import (
     encrypt_string,
     decrypt_string,
     encrypt_data_to_file,
+    encrypt_async_byte_stream_to_file,
+    FileTooLargeError,
 )
 from utils.log import get_logger
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
@@ -53,6 +55,93 @@ settings = get_settings()
 api_file_storage_dir = settings.API_FILE_STORAGE_DIR
 
 logger = get_logger()
+
+
+@router.post("/transcriber/stream")
+async def transcribe_file_stream(
+    request: Request,
+    filename: str = Query(...),
+    user: dict = Depends(get_current_user),
+) -> JSONResponse:
+    """
+    Transcribe an audio file uploaded as a raw streaming body.
+
+    Avoids FastAPI multipart UploadFile buffering: the request body is encrypted
+    directly to disk as it is received, holding only one chunk in memory and
+    writing no plaintext temp file (v2 compact format).
+    """
+
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            content={"result": {"error": "File exceeds maximum allowed size"}},
+            status_code=413,
+        )
+
+    user_public_key = await user_get_public_key(user["user_id"])
+    user_public_key = deserialize_public_key_from_pem(user_public_key)
+
+    job = await job_create(
+        user_id=user["user_id"],
+        job_type=JobType.TRANSCRIPTION,
+        filename=encrypt_string(user_public_key, filename),
+    )
+
+    if not (api_user := await user_get(username="api_user")):
+        return JSONResponse(
+            content={"result": {"error": "API user not found"}}, status_code=500
+        )
+
+    public_key = await user_get_public_key(api_user["user_id"])
+    public_key = deserialize_public_key_from_pem(public_key)
+
+    file_path = Path(api_file_storage_dir + "/" + user["user_id"])
+    dest_path = file_path / job["uuid"]
+
+    if not file_path.exists():
+        file_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        await encrypt_async_byte_stream_to_file(
+            public_key,
+            request.stream(),
+            str(dest_path),
+            chunk_size=settings.CRYPTO_CHUNK_SIZE,
+            max_bytes=settings.MAX_UPLOAD_BYTES,
+        )
+
+        job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED)
+    except FileTooLargeError:
+        dest_path.unlink(missing_ok=True)
+        job = await job_update(
+            job["uuid"],
+            user["user_id"],
+            status=JobStatusEnum.FAILED,
+            error="File exceeds maximum allowed size",
+        )
+        return JSONResponse(
+            content={"result": {"error": "File exceeds maximum allowed size"}},
+            status_code=413,
+        )
+    except Exception as e:
+        # Never leave a partial/corrupt ciphertext behind.
+        dest_path.unlink(missing_ok=True)
+        job = await job_update(
+            job["uuid"], user["user_id"], status=JobStatusEnum.FAILED, error=str(e)
+        )
+        return JSONResponse(content={"result": {"error": str(e)}}, status_code=500)
+
+    return JSONResponse(
+        content={
+            "result": {
+                "uuid": job["uuid"],
+                "user_id": user["user_id"],
+                "status": job["status"],
+                "job_type": job["job_type"],
+                "filename": filename,
+            }
+        }
+    )
 
 
 def decrypt_filename(job: dict, private_key) -> dict:
