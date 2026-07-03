@@ -28,6 +28,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi_utils.tasks import repeat_every
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.formparsers import MultiPartParser
 
 from auth.oidc import RefreshToken, oauth, verify_token
 from db.analytics import log_page_view
@@ -64,6 +65,16 @@ from utils.settings import get_settings
 
 settings = get_settings()
 log = get_logger()
+
+# Multipart uploads (the /transcriber fallback and the mTLS worker/Kaltura
+# PUT /job/{user}/{job}/file) are spooled by Starlette on the way in. Route that
+# spool off the small root disk onto UPLOAD_TMP_DIR and keep the in-RAM threshold
+# low, so the receive phase stays bounded; both handlers then stream from the
+# spool one chunk at a time. The /transcriber/stream endpoint uses
+# request.stream() and no spool at all. The dir is provisioned by ops.
+if settings.UPLOAD_TMP_DIR:
+    tempfile.tempdir = settings.UPLOAD_TMP_DIR
+MultiPartParser.spool_max_size = 1024 * 1024 * settings.MULTIPART_SPOOL_MAX_SIZE_MB
 
 scheduler = None
 scheduler_worker = False
@@ -140,6 +151,7 @@ def acquire_scheduler_lock() -> None:
 # Only mutating/meaningful endpoints are tracked.
 ANALYTICS_ROUTE_MAP = {
     ("POST", f"{settings.API_PREFIX}/transcriber"): "upload",
+    ("POST", f"{settings.API_PREFIX}/transcriber/stream"): "upload",
     ("DELETE", f"{settings.API_PREFIX}/transcriber/{{job_id}}"): "delete_job",
     ("PUT", f"{settings.API_PREFIX}/transcriber/{{job_id}}"): "transcription",
     (
