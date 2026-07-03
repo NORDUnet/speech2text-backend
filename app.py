@@ -22,13 +22,14 @@ import tempfile
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.openapi.docs import get_swagger_ui_html
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi_utils.tasks import repeat_every
 from starlette.middleware.sessions import SessionMiddleware
 
-from auth.oidc import RefreshToken, oauth, verify_token, verify_user
+from auth.oidc import RefreshToken, oauth, verify_token
 from db.analytics import log_page_view
 from db.onboarding_attributes import seed_default_attributes
 from db.job import job_cleanup
@@ -75,7 +76,7 @@ app = FastAPI(
     description=settings.API_DESCRIPTION,
     version=settings.API_VERSION,
     secret_key=settings.API_SECRET_KEY,
-    docs_url="/api/docs",
+    docs_url=None,
     openapi_url="/api/openapi.json",
     openapi_tags=[
         {
@@ -405,21 +406,129 @@ async def refresh(request: Request, refresh_token: RefreshToken):
     return JSONResponse(payload)
 
 
-@app.get("/api/docs")
-async def docs(request: Request) -> RedirectResponse:
+SWAGGER_DARK_RULES = """
+  body { background-color: #121212; }
+  .swagger-ui, .swagger-ui .info .title, .swagger-ui .info li, .swagger-ui .info p,
+  .swagger-ui .info table, .swagger-ui label, .swagger-ui .opblock-tag,
+  .swagger-ui .opblock .opblock-summary-operation-id,
+  .swagger-ui .opblock .opblock-summary-path,
+  .swagger-ui .opblock .opblock-summary-path__deprecated,
+  .swagger-ui .opblock .opblock-summary-description,
+  .swagger-ui .opblock-description-wrapper p, .swagger-ui .opblock-title_normal p,
+  .swagger-ui .responses-inner h4, .swagger-ui .responses-inner h5,
+  .swagger-ui .response-col_status, .swagger-ui table thead tr td,
+  .swagger-ui table thead tr th, .swagger-ui .parameter__name,
+  .swagger-ui .parameter__type, .swagger-ui .parameter__in, .swagger-ui .tab li,
+  .swagger-ui .col_header, .swagger-ui .model-title, .swagger-ui .model,
+  .swagger-ui section.models h4, .swagger-ui .scheme-container .schemes-title,
+  .swagger-ui .parameter__name.required span, .swagger-ui .response-col_links {
+    color: #e6e6e6 !important;
+  }
+  .swagger-ui .topbar { background-color: #1e1e1e; }
+  .swagger-ui .scheme-container { background-color: #1a1a1a !important; box-shadow: none; }
+  .swagger-ui .opblock { background: #1b1b1b; border-color: #2e2e2e; box-shadow: none; }
+  .swagger-ui .opblock .opblock-summary { border-color: #2e2e2e; }
+  .swagger-ui .opblock .opblock-section-header { background: #242424; box-shadow: none; }
+  .swagger-ui .opblock .opblock-section-header h4,
+  .swagger-ui .opblock .opblock-section-header label { color: #e6e6e6 !important; }
+  .swagger-ui section.models { background: #1b1b1b; border-color: #2e2e2e; }
+  .swagger-ui section.models .model-container { background: #242424; }
+  .swagger-ui input, .swagger-ui textarea, .swagger-ui select {
+    background-color: #242424 !important; color: #e6e6e6 !important; border: 1px solid #444 !important;
+  }
+  .swagger-ui .btn { color: #e6e6e6; border-color: #555; background: #242424; box-shadow: none; }
+  .swagger-ui .btn.authorize, .swagger-ui .btn.execute {
+    background-color: #005eb8; color: #fff; border-color: #005eb8;
+  }
+  .swagger-ui .btn.authorize span { color: #fff; }
+  .swagger-ui .btn.authorize svg { fill: #fff; }
+  .swagger-ui .highlight-code, .swagger-ui .microlight { background: #0d0d0d !important; }
+  .swagger-ui .markdown code, .swagger-ui .renderedMarkdown code {
+    background: #0d0d0d; color: #f08d49;
+  }
+  .swagger-ui .model-box { background: #242424; }
+  .swagger-ui .prop-type { color: #8bd0ff; }
+  .swagger-ui table.model tr td { color: #cfcfcf; }
+  .swagger-ui .tab li.active { color: #fff; }
+  .swagger-ui .info a, .swagger-ui a.nostyle, .swagger-ui .info a:hover { color: #4ea3e0; }
+  .swagger-ui svg.arrow { fill: #cfcfcf; }
+  .swagger-ui .opblock-summary-method { color: #fff; }
+  .swagger-ui .errors-wrapper { background: #2a1a1a; border-color: #5a2a2a; }
+  .swagger-ui .info .base-url, .swagger-ui .info .title small pre { color: #b0b0b0; }
+  /* Schemas section: Swagger's JSON Schema 2020-12 renderer. The name/expand
+     buttons default to a light (#efefef) pill and the rows to a light tint —
+     recolour them for dark, and make all text in the family light. */
+  .swagger-ui article.json-schema-2020-12 { background-color: rgba(255, 255, 255, 0.04) !important; }
+  .swagger-ui .json-schema-2020-12-accordion,
+  .swagger-ui .json-schema-2020-12-expand-deep-button {
+    background-color: #2a2a2a !important; border-color: #444 !important;
+  }
+  .swagger-ui [class*="json-schema-2020-12"] { color: #e6e6e6 !important; }
+  .swagger-ui [class*="json-schema-2020-12"] svg { fill: #cfcfcf !important; }
+  /* Type labels (object/string/...) — keep them coloured like light mode, but a
+     lighter purple that reads on dark. Declared after the broad rule to win. */
+  .swagger-ui .json-schema-2020-12__attribute--primary { color: #afa9ec !important; }
+  /* "Available authorizations" modal (Authorize popup) */
+  .swagger-ui .dialog-ux .modal-ux { background-color: #1b1b1b !important; border: 1px solid #2e2e2e !important; }
+  .swagger-ui .dialog-ux .modal-ux-header { border-bottom-color: #2e2e2e !important; }
+  .swagger-ui .dialog-ux .modal-ux-header h3,
+  .swagger-ui .dialog-ux .modal-ux-content h4,
+  .swagger-ui .dialog-ux .modal-ux-content p,
+  .swagger-ui .dialog-ux .modal-ux-content label,
+  .swagger-ui .dialog-ux .modal-ux-content .auth-container h4,
+  .swagger-ui .dialog-ux .modal-ux-content code,
+  .swagger-ui .scopes h2 { color: #e6e6e6 !important; }
+  .swagger-ui .dialog-ux .modal-ux-header .close-modal svg { fill: #cfcfcf !important; }
+  .swagger-ui .auth-container { border-bottom-color: #2e2e2e !important; }
+  .swagger-ui .backdrop-ux { background-color: rgba(0, 0, 0, 0.6) !important; }
+"""
+
+
+def _swagger_theme_css(theme: str) -> str:
     """
-    Redirect to the API documentation after verifying the user.
+    Build the <style> block for the Swagger UI page based on the requested theme.
+
+    Parameters:
+        theme (str): "dark", "light", or "auto" (follow the OS preference).
+
+    Returns:
+        str: A <style> block (empty-ish for light) to inject into the docs HTML.
+    """
+
+    if theme == "light":
+        return ""
+    if theme == "dark":
+        return f"<style>{SWAGGER_DARK_RULES}</style>"
+    # auto: follow the viewer's OS/browser colour-scheme preference
+    return (
+        "<style>@media (prefers-color-scheme: dark) {"
+        f"{SWAGGER_DARK_RULES}"
+        "}</style>"
+    )
+
+
+@app.get("/api/docs", include_in_schema=False)
+async def docs(request: Request) -> HTMLResponse:
+    """
+    Serve the Swagger UI API documentation, themed via the `theme` query
+    parameter ("dark", "light", or "auto") so it follows the user's choice.
 
     Parameters:
         request (Request): The incoming HTTP request.
 
     Returns:
-        RedirectResponse: Redirects to the API documentation.
+        HTMLResponse: The Swagger UI page with the requested theme.
     """
 
-    await verify_user(request)
+    theme = request.query_params.get("theme", "auto")
 
-    return RedirectResponse(url="/docs")
+    html = get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{settings.API_TITLE} - API documentation",
+    ).body.decode("utf-8")
+    html = html.replace("</head>", _swagger_theme_css(theme) + "</head>")
+
+    return HTMLResponse(html)
 
 
 @app.on_event("startup")
