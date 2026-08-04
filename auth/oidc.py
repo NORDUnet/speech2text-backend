@@ -186,7 +186,12 @@ async def verify_user(request: Request, admin: Optional[bool] = False) -> str:
     # Create or update the user in the database
     user_id = decoded_jwt["sub"]
     username = decoded_jwt.get("preferred_username")
-    realm = decoded_jwt.get("realm", username.split("@")[-1])
+    realm_claim = decoded_jwt.get("realm")
+    realm = realm_claim or (username.split("@")[-1] if "@" in username else "")
+    log.info(
+        f"[realm] user={username} claim={realm_claim!r} chosen={realm!r} "
+        f"source={'schac-claim' if realm_claim else 'email-fallback'}"
+    )
 
     user = await user_create(
         username=username,

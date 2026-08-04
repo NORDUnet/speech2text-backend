@@ -315,9 +315,13 @@ async def auth(request: Request):
     try:
         decoded_jwt = await verify_token(id_token=token["access_token"])
         username = decoded_jwt.get("preferred_username", "")
-        realm = decoded_jwt.get(
-            "realm", username.split("@")[-1] if "@" in username else ""
+        realm_claim = decoded_jwt.get("realm")
+        realm = realm_claim or (username.split("@")[-1] if "@" in username else "")
+        log.info(
+            f"[realm] user={username} claim={realm_claim!r} chosen={realm!r} "
+            f"source={'schac-claim' if realm_claim else 'email-fallback'}"
         )
+        
         user = await user_create(
             username=username,
             realm=realm,
