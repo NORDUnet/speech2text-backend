@@ -175,3 +175,15 @@ class UpdateAnnouncementRequest(BaseModel):
     starts_at: Optional[str] = None
     ends_at: Optional[str] = None
     enabled: Optional[bool] = None
+
+
+class CreateFeedbackRequest(BaseModel):
+    category: str = "other"
+    message: str
+    page: Optional[str] = None
+    anonymous: bool = False
+
+
+class UpdateFeedbackRequest(BaseModel):
+    status: Optional[str] = None
+    admin_note: Optional[str] = None

@@ -928,3 +928,53 @@ class WorkerHealth(SQLModel, table=True):
         default_factory=datetime.utcnow,
         description="Timestamp when the health entry was recorded",
     )
+
+
+class Feedback(SQLModel, table=True):
+    """
+    Model representing user-submitted feedback (bug reports, feature ideas).
+    Stored in the database only — no notifications are sent on submission.
+    """
+
+    __tablename__ = "feedback"
+    __table_args__ = (
+        Index("ix_feedback_realm", "realm"),
+        Index("ix_feedback_created_at", "created_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True, description="Primary key")
+    user_id: str = Field(description="ID of the user who submitted the feedback")
+    username: str = Field(default="", description="Username at submission time")
+    realm: str = Field(default="", description="User's realm at submission time")
+    category: str = Field(
+        default="other", description="Feedback category: bug, feature or other"
+    )
+    message: str = Field(description="The feedback text")
+    page: Optional[str] = Field(
+        default=None, description="UI path the feedback was submitted from"
+    )
+    status: str = Field(
+        default="new",
+        description="Triage status: new, reviewed, planned, done or declined",
+    )
+    admin_note: Optional[str] = Field(
+        default=None, description="Internal note set by an admin"
+    )
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="Submission timestamp",
+    )
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "username": self.username,
+            "realm": self.realm,
+            "category": self.category,
+            "message": self.message,
+            "page": self.page,
+            "status": self.status,
+            "admin_note": self.admin_note,
+            "created_at": str(self.created_at),
+        }
