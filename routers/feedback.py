@@ -31,7 +31,7 @@ log = get_logger()
 router = APIRouter(tags=["feedback"])
 
 FEEDBACK_CATEGORIES = {"bug", "feature", "other"}
-FEEDBACK_STATUSES = {"new", "reviewed", "planned", "done", "declined"}
+FEEDBACK_STATUSES = {"new", "reviewed"}
 FEEDBACK_MESSAGE_MAX_LENGTH = 5000
 
 

@@ -955,7 +955,7 @@ class Feedback(SQLModel, table=True):
     )
     status: str = Field(
         default="new",
-        description="Triage status: new, reviewed, planned, done or declined",
+        description="Triage status: new or reviewed",
     )
     admin_note: Optional[str] = Field(
         default=None, description="Internal note set by an admin"
