@@ -229,6 +229,7 @@ async def job_update(
     error: Optional[str] = None,
     output_format: Optional[str] = None,
     transcribed_seconds: Optional[int] = 0,
+    expected_status: Optional[JobStatusEnum] = None,
 ) -> Optional[Job]:
     """
     Update a job by UUID.
@@ -259,6 +260,10 @@ async def job_update(
 
         if not job:
             return None
+        # Compare while holding the row lock: repeated upload submissions must
+        # never reset a queued, running or completed job back to pending.
+        if expected_status is not None and job.status != expected_status:
+            return job.as_dict()
         if status:
             job.status = status
         if error:

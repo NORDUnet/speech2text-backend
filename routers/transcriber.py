@@ -15,7 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from fastapi import APIRouter, UploadFile, Request, Depends, Query, File
+from uuid import UUID
+from fastapi import APIRouter, UploadFile, Request, Depends, Query, File, Header
 from fastapi.responses import JSONResponse
 from db.job import (
     job_create,
@@ -61,6 +62,7 @@ logger = get_logger()
 async def transcribe_file_stream(
     request: Request,
     filename: str = Query(...),
+    x_upload_id: UUID | None = Header(default=None),
     user: dict = Depends(get_current_user),
 ) -> JSONResponse:
     """
@@ -85,6 +87,7 @@ async def transcribe_file_stream(
         user_id=user["user_id"],
         job_type=JobType.TRANSCRIPTION,
         filename=encrypt_string(user_public_key, filename),
+        external_id=f"ui-upload:{x_upload_id.hex}" if x_upload_id else None,
     )
 
     if not (api_user := await user_get(username="api_user")):
@@ -332,6 +335,7 @@ async def update_transcription_status(
     request: Request,
     item: TranscriptionStatusPut,
     job_id: str,
+    x_upload_id: UUID | None = Header(default=None),
     user: dict = Depends(get_current_user),
 ) -> JSONResponse:
     """
@@ -347,6 +351,17 @@ async def update_transcription_status(
     Returns:
         JSONResponse: The updated job status.
     """
+
+    if x_upload_id is not None:
+        existing = await job_get(job_id, user["user_id"])
+        if not existing:
+            return JSONResponse(content={"result": {"error": "Job not found"}}, status_code=404)
+        if existing.get("external_id") != f"ui-upload:{x_upload_id.hex}":
+            return JSONResponse(content={"result": {"error": "Upload ID does not match this job"}}, status_code=403)
+        if existing["status"] != "uploaded":
+            if existing["status"] in ("pending", "in_progress", "completed"):
+                return JSONResponse(content={"result": {"uuid": job_id, "status": existing["status"]}})
+            return JSONResponse(content={"result": {"error": "Upload is not ready for transcription"}}, status_code=409)
 
     quota_left = await user_get_quota_left(user["user_id"])
 
@@ -371,6 +386,7 @@ async def update_transcription_status(
             status="pending",
             output_format=item.output_format,
             error=None,
+            expected_status=JobStatusEnum.UPLOADED if x_upload_id is not None else None,
         )
     ):
         return JSONResponse(
