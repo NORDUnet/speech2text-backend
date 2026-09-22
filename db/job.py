@@ -668,3 +668,27 @@ async def job_result_save(
         log.info(f"Job result for job {uuid} saved for user {user_id}.")
 
         return job_result.as_dict()
+
+
+async def fail_unqueued_upload(user_id: str, upload_id: str, error: str = "Upload & transcribe failed before transcription started. Upload the file again."):
+    """Never overwrite a successful queue submission, even after a lost response."""
+    async with get_async_session() as session:
+        result = await session.execute(select(Job).where(
+            Job.user_id == user_id, Job.external_id == "ui-upload:" + upload_id
+        ).with_for_update())
+        job = result.scalars().first()
+        if not job:
+            return None
+        remove_source = job.status == JobStatusEnum.UPLOADED
+        failed = job.status in (JobStatusEnum.UPLOADING, JobStatusEnum.UPLOADED)
+        if failed:
+            job.status = JobStatusEnum.FAILED
+            job.error = error
+        result = job.as_dict()
+    if remove_source:
+        # The row can no longer be queued; do not retain an unusable source file.
+        try:
+            (Path(settings.API_FILE_STORAGE_DIR) / user_id / result["uuid"]).unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove source file for failed upload")
+    return result

@@ -21,6 +21,7 @@ from fastapi import APIRouter, UploadFile, Request, Depends, Query, File, Header
 from fastapi.responses import JSONResponse
 from db.job import (
     job_create,
+    fail_unqueued_upload,
     job_remove,
     job_get,
     job_get_all,
@@ -121,7 +122,13 @@ async def transcribe_file_stream(
             max_bytes=settings.MAX_UPLOAD_BYTES,
         )
 
-        job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED)
+        job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED,
+                               expected_status=JobStatusEnum.UPLOADING)
+        if job["status"] != "uploaded":
+            # A failed browser operation must not become an uploaded orphan if
+            # the server finishes receiving its bytes after failure was reported.
+            dest_path.unlink(missing_ok=True)
+            return JSONResponse(content={"result": {"error": "Upload failed. Upload the file again."}}, status_code=409)
     except FileTooLargeError:
         dest_path.unlink(missing_ok=True)
         job = await job_update(
@@ -278,7 +285,13 @@ async def transcribe_file(
             chunk_size=settings.CRYPTO_CHUNK_SIZE,
         )
 
-        job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED)
+        job = await job_update(job["uuid"], status=JobStatusEnum.UPLOADED,
+                               expected_status=JobStatusEnum.UPLOADING)
+        if job["status"] != "uploaded":
+            # A failed browser operation must not become an uploaded orphan if
+            # the server finishes receiving its bytes after failure was reported.
+            dest_path.unlink(missing_ok=True)
+            return JSONResponse(content={"result": {"error": "Upload failed. Upload the file again."}}, status_code=409)
     except Exception as e:
         job = await job_update(
             job["uuid"], user["user_id"], status=JobStatusEnum.FAILED, error=str(e)
@@ -362,20 +375,22 @@ async def update_transcription_status(
         JSONResponse: The updated job status.
     """
 
-    if x_upload_id is not None:
-        existing = await job_get(job_id, user["user_id"])
-        if not existing:
-            return JSONResponse(content={"result": {"error": "Job not found"}}, status_code=404)
-        if existing.get("external_id") != f"ui-upload:{x_upload_id.hex}":
-            return JSONResponse(content={"result": {"error": "Upload ID does not match this job"}}, status_code=403)
-        if existing["status"] != "uploaded":
-            if existing["status"] in ("pending", "in_progress", "completed"):
-                return JSONResponse(content={"result": {"uuid": job_id, "status": existing["status"]}})
-            return JSONResponse(content={"result": {"error": "Upload is not ready for transcription"}}, status_code=409)
+    existing = await job_get(job_id, user["user_id"])
+    if not existing:
+        return JSONResponse(content={"result": {"error": "Job not found"}}, status_code=404)
+    if x_upload_id is not None and existing.get("external_id") != f"ui-upload:{x_upload_id.hex}":
+        return JSONResponse(content={"result": {"error": "Upload ID does not match this job"}}, status_code=403)
+    if existing["status"] != "uploaded":
+        if existing["status"] in ("pending", "in_progress", "completed"):
+            return JSONResponse(content={"result": {"uuid": job_id, "status": existing["status"]}})
+        return JSONResponse(content={"result": {"error": "Upload is not ready for transcription"}}, status_code=409)
 
     quota_left = await user_get_quota_left(user["user_id"])
 
     if not quota_left:
+        if x_upload_id is not None:
+            await fail_unqueued_upload(user["user_id"], x_upload_id.hex,
+                "Transcription quota exceeded. Contact your administrator, then upload the file again.")
         record("group.limit_blocked")
         logger.warning(f"Quota exceeded for user {user['user_id']}")
         return JSONResponse(
@@ -397,12 +412,15 @@ async def update_transcription_status(
             status="pending",
             output_format=item.output_format,
             error=None,
-            expected_status=JobStatusEnum.UPLOADED if x_upload_id is not None else None,
+            expected_status=JobStatusEnum.UPLOADED,
         )
     ):
         return JSONResponse(
             content={"result": {"error": "Job not found"}}, status_code=404
         )
+
+    if job["status"] not in ("pending", "in_progress", "completed"):
+        return JSONResponse(content={"result": {"error": "Upload & transcribe failed. Upload the file again."}}, status_code=409)
 
     # Try to decrypt the filename for the response
     filename = job["filename"]
@@ -431,6 +449,16 @@ async def update_transcription_status(
             }
         }
     )
+
+
+@router.post("/transcriber/uploads/{upload_id}/fail", include_in_schema=False)
+async def fail_upload(upload_id: UUID, user: dict = Depends(get_current_user)):
+    result = await fail_unqueued_upload(user["user_id"], upload_id.hex)
+    if result is None:
+        return JSONResponse(content={"result": {"error": "Upload not found"}}, status_code=404)
+    return JSONResponse(content={"result": {
+        "uuid": result["uuid"], "status": result["status"], "error": result.get("error", "")
+    }})
 
 
 @router.put("/transcriber/{job_id}/result")

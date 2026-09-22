@@ -49,3 +49,39 @@ class SubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.language, 'original')
         sql = str(session.execute.call_args.args[0].compile(dialect=postgresql.dialect()))
         self.assertIn('FOR UPDATE', sql)
+
+
+    async def test_failed_job_cannot_be_requeued(self):
+        with patch.object(route, 'job_get', AsyncMock(return_value=dict(status='failed'))), patch.object(route,'job_update',AsyncMock()) as update:
+            response = await route.update_transcription_status(None,None,'job',None,{'user_id':'owner'})
+        self.assertEqual(response.status_code,409)
+        update.assert_not_awaited()
+
+    async def test_finalize_failure_does_not_overwrite_accepted_queue(self):
+        for status in ('pending','in_progress','completed','uploading','uploaded'):
+            row=SimpleNamespace(uuid='job',status=status,error='')
+            row.as_dict=lambda:dict(uuid=row.uuid,status=row.status,error=row.error)
+            session=SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda:SimpleNamespace(first=lambda:row))))
+            @asynccontextmanager
+            async def isolated_session():
+                yield session
+            with patch.object(jobs,'get_async_session',isolated_session), patch('pathlib.Path.unlink') as unlink:
+                result=await jobs.fail_unqueued_upload('owner','upload-id')
+            self.assertEqual(result['status'],'failed' if status in ('uploaded','uploading') else status)
+            self.assertEqual(unlink.call_count,int(status=='uploaded'))
+            sql=str(session.execute.call_args.args[0].compile(dialect=postgresql.dialect()))
+            self.assertIn('FOR UPDATE',sql)
+            self.assertIn('user_id',sql)
+            self.assertIn('external_id',sql)
+
+
+    async def test_late_upload_completion_cannot_revive_failed_job(self):
+        row=SimpleNamespace(status=JobStatusEnum.FAILED)
+        row.as_dict=lambda:dict(status=row.status)
+        session=SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda:SimpleNamespace(first=lambda:row))))
+        @asynccontextmanager
+        async def isolated_session():
+            yield session
+        with patch.object(jobs,'get_async_session',isolated_session):
+            result=await jobs.job_update('job',status=JobStatusEnum.UPLOADED,expected_status=JobStatusEnum.UPLOADING)
+        self.assertEqual(result['status'],JobStatusEnum.FAILED)
