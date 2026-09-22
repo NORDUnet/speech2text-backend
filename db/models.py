@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import List, Optional
 from uuid import uuid4
@@ -978,3 +978,11 @@ class Feedback(SQLModel, table=True):
             "admin_note": self.admin_note,
             "created_at": str(self.created_at),
         }
+
+
+class UsageCounter(SQLModel, table=True):
+    """Weekly global totals only; deliberately no identity columns."""
+    __tablename__ = "usage_counters"
+    week: date = Field(primary_key=True)
+    metric: str = Field(primary_key=True, max_length=64)
+    count: int = Field(default=0)

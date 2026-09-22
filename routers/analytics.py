@@ -221,3 +221,37 @@ async def analytics_stats(
         return JSONResponse(content={"error": "User not authorized"}, status_code=403)
 
     return JSONResponse(content={"result": await get_total_stats()})
+
+
+# Strict, bounded payload: arbitrary properties/identifiers cannot enter storage.
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from fastapi import HTTPException, Query
+from auth.oidc import get_current_user
+from utils.usage import UI_METRICS, record
+from db.usage import summary as usage_summary
+
+
+class UsageBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    counters: dict[str, StrictInt] = Field(max_length=32)
+
+    @model_validator(mode="after")
+    def validate_counters(self):
+        if any(key not in UI_METRICS or not 1 <= value <= 10000
+               for key, value in self.counters.items()):
+            raise ValueError("Invalid usage counters")
+        return self
+
+
+@router.post("/analytics/usage", status_code=204, include_in_schema=False)
+async def collect_usage(batch: UsageBatch, user: dict = Depends(get_current_user)):
+    for metric, count in batch.counters.items():
+        record(metric, count)
+
+
+@router.get("/admin/analytics/usage", include_in_schema=False)
+async def usage_statistics(weeks: int = Query(default=4, ge=1, le=52),
+                           admin_user: dict = Depends(get_current_admin_user)):
+    if not admin_user.get("bofh"):
+        raise HTTPException(status_code=403, detail="BOFH access required")
+    return {"result": await usage_summary(weeks)}

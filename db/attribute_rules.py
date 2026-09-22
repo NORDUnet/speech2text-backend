@@ -17,6 +17,7 @@
 
 import re
 
+from utils.usage import record
 from typing import Optional
 
 from sqlalchemy import select
@@ -298,6 +299,7 @@ async def evaluate_rules(decoded_jwt: dict, user: dict) -> dict:
                 )
                 continue
 
+            record("provision.matched")
             rule_actions = []
             if rule.deny and not manually_activated:
                 actions["deny"] = True
@@ -355,18 +357,28 @@ async def apply_rule_actions(actions: dict, user: dict) -> None:
         if not db_user:
             return
 
+        changed = False
         if actions.get("deny"):
+            changed = db_user.active
             log.info(f"Deny rule matched for user {user_id}, deactivating.")
             db_user.active = False
+            await session.commit()
+            if changed:
+                record("provision.changed")
             return
 
         if actions.get("activate") and not db_user.active:
             log.info(f"Auto-activating user {user_id} via attribute rule.")
             db_user.active = True
+            changed = True
 
         if actions.get("admin") and not db_user.admin:
             log.info(f"Auto-granting admin to user {user_id} via attribute rule.")
             db_user.admin = True
+            changed = True
+
+    if changed:
+        record("provision.changed")
 
     # Group assignment — only if the user is not already in any group
     group_id = actions.get("group")
@@ -405,7 +417,7 @@ async def apply_rule_actions(actions: dict, user: dict) -> None:
                         f"skipping group assignment for user {user_id}."
                     )
                 else:
-                    await group_add_user(int(group_id), username)
+                    await group_add_user(int(group_id), username, provisioning=True)
             except (ValueError, TypeError):
                 log.warning(
                     f"Could not assign user {user_id} to group {group_id}."

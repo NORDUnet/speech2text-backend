@@ -17,6 +17,7 @@
 
 import json
 
+from utils.usage import record
 from datetime import datetime, timedelta
 from db.models import (
     Job,
@@ -264,6 +265,7 @@ async def job_update(
         # never reset a queued, running or completed job back to pending.
         if expected_status is not None and job.status != expected_status:
             return job.as_dict()
+        newly_queued = status == "pending" and job.status != "pending"
         if status:
             job.status = status
         if error:
@@ -281,7 +283,12 @@ async def job_update(
 
         log.info(f"Job {job.uuid} updated for user {user_id}.")
 
-        return job.as_dict()
+        updated = job.as_dict()
+    if newly_queued:
+        kind = {"txt": "transcript", "srt": "subtitles"}.get(updated["output_format"])
+        if kind:
+            record(f"queued.{kind}")
+    return updated
 
 
 async def job_remove(uuid: str) -> bool:

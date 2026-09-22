@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from utils.usage import record
 from db.customer import customer_get_from_user_id
 from db.models import Group, GroupModelLink, GroupUserLink, User
 from db.session import get_async_session, get_session
@@ -71,7 +72,9 @@ async def group_create(
 
         log.info(f"Group {group.id} created with name {name}.")
 
-        return group.as_dict()
+        created = group.as_dict()
+    record("group.created")
+    return created
 
 
 async def group_get(group_id: int, realm: str, user_id: Optional[str] = "") -> Optional[dict]:
@@ -449,7 +452,7 @@ async def group_update(
         return group.as_dict()
 
 
-async def group_add_user(group_id: int, username: str, role: str = "member") -> dict:
+async def group_add_user(group_id: int, username: str, role: str = "member", *, provisioning: bool = False) -> dict:
     """
     Add a user to a group with a given role.
 
@@ -479,13 +482,18 @@ async def group_add_user(group_id: int, username: str, role: str = "member") -> 
             )
         )
         link = result.scalars().first()
+        added = not link
         if not link:
             link = GroupUserLink(group_id=group_id, user_id=user_id, role=role)
             session.add(link)
 
         log.info(f"User {user_id} added to group {group_id} with role {role}.")
 
-        return {"group_id": group_id, "user_id": user_id, "role": role}
+    if added:
+        record("group.member_added")
+        if provisioning:
+            record("provision.changed")
+    return {"group_id": group_id, "user_id": user_id, "role": role}
 
 
 async def group_remove_user(group_id: int, username: str) -> bool:

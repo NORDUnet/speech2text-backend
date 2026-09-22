@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from utils.usage import record, size_metric
 from uuid import UUID
 from fastapi import APIRouter, UploadFile, Request, Depends, Query, File, Header
 from fastapi.responses import JSONResponse
@@ -104,10 +105,17 @@ async def transcribe_file_stream(
     if not file_path.exists():
         file_path.mkdir(parents=True, exist_ok=True)
 
+    uploaded_bytes = 0
+    async def measured_stream():
+        nonlocal uploaded_bytes
+        async for chunk in request.stream():
+            uploaded_bytes += len(chunk)
+            yield chunk
+
     try:
         await encrypt_async_byte_stream_to_file(
             public_key,
-            request.stream(),
+            measured_stream(),
             str(dest_path),
             chunk_size=settings.CRYPTO_CHUNK_SIZE,
             max_bytes=settings.MAX_UPLOAD_BYTES,
@@ -134,6 +142,7 @@ async def transcribe_file_stream(
         )
         return JSONResponse(content={"result": {"error": str(e)}}, status_code=500)
 
+    record(size_metric(uploaded_bytes))
     return JSONResponse(
         content={
             "result": {
@@ -276,6 +285,7 @@ async def transcribe_file(
         )
         return JSONResponse(content={"result": {"error": str(e)}}, status_code=500)
 
+    record(size_metric(len(file_bytes)))
     return JSONResponse(
         content={
             "result": {
@@ -366,6 +376,7 @@ async def update_transcription_status(
     quota_left = await user_get_quota_left(user["user_id"])
 
     if not quota_left:
+        record("group.limit_blocked")
         logger.warning(f"Quota exceeded for user {user['user_id']}")
         return JSONResponse(
             content={
