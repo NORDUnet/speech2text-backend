@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import JSONResponse
 from db.attribute_rules import (
     rule_create,
@@ -26,6 +26,8 @@ from db.attribute_rules import (
     rule_delete,
     test_rules,
 )
+from db.group import group_get
+from utils.provisioning import claim_values, match_condition, evaluate_provisioning, summarize_provisioning
 from db.onboarding_attributes import (
     attribute_get_all,
     attribute_add,
@@ -41,6 +43,8 @@ from utils.validators import (
     UpdateAttributeRuleRequest,
     CreateOnboardingAttributeRequest,
     TestRulesRequest,
+    SimulateProvisioningRequest,
+    MatchRuleRequest,
 )
 
 log = get_logger()
@@ -89,6 +93,27 @@ def _rule_realm_overlaps(rule_realm: str | None, allowed: list[str]) -> bool:
     return bool(rule_realms & set(allowed))
 
 
+def _can_manage_rule(rule: dict, admin: dict) -> bool:
+    if admin.get("bofh"):
+        return True
+    scopes = {r.strip() for r in (rule.get("realm") or "").split(",") if r.strip()}
+    return bool(scopes) and scopes.issubset(set(_get_admin_allowed_realms(admin)))
+
+
+async def _validate_group(group_id: str | None, admin: dict) -> None:
+    if group_id is None:
+        return
+    try:
+        number = int(group_id)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Invalid group")
+    if number <= 0 or not await group_get(
+        number, realm="*" if admin["bofh"] else admin.get("realm", ""),
+        user_id=admin["user_id"],
+    ):
+        raise HTTPException(403, "Group is not available to this administrator")
+
+
 @router.get("/admin/rules", include_in_schema=False)
 async def list_rules(
     request: Request,
@@ -110,7 +135,8 @@ async def list_rules(
     else:
         realm = _get_admin_allowed_realms(admin_user)
 
-    return JSONResponse(content={"result": await rule_get_all(realm=realm)})
+    rules = await rule_get_all(realm=realm) if realm else []
+    return JSONResponse(content={"result": [dict(r, can_manage=_can_manage_rule(r, admin_user)) for r in rules]})
 
 
 @router.post("/admin/rules")
@@ -131,9 +157,11 @@ async def create_rule(
     if admin_user["bofh"]:
         realm = item.realm
     else:
-        allowed = _get_admin_allowed_realms(admin_user)
-        realm = item.realm if item.realm in allowed else allowed[0]
+        realm = item.realm
+        if not _can_manage_rule({"realm": realm}, admin_user):
+            raise HTTPException(403, "Choose only realms managed by this administrator")
 
+    await _validate_group(item.assign_to_group, admin_user)
     rule = await rule_create(
         name=item.name,
         attribute_name=item.attribute_name,
@@ -186,8 +214,8 @@ async def update_rule_endpoint(
     """
     Update an attribute rule.
 
-    For non-BOFH admins, if the rule's realm(s) overlap with the admin's allowed realms,
-    they can update the rule but cannot move it to a realm they don't manage.
+    Non-BOFH admins must manage every realm covered by the rule.
+    Global rules can only be changed by BOFH.
 
     Parameters:
         request: The incoming HTTP request.
@@ -203,21 +231,17 @@ async def update_rule_endpoint(
         if not (existing := await rule_get(rule_id)):
             return JSONResponse(content={"error": "Rule not found"}, status_code=404)
 
-        allowed = _get_admin_allowed_realms(admin_user)
-
-        if not _rule_realm_overlaps(existing.get("realm"), allowed):
+        if not _can_manage_rule(existing, admin_user):
             log.warning(f"Admin {admin_user['user_id']} denied update access to rule {rule_id} (realm mismatch)")
             return JSONResponse(content={"error": "Not authorized"}, status_code=403)
 
-        # Prevent non-BOFH from moving rule to a realm they don't manage
-        if item.realm is not None:
-            new_realms = {r.strip() for r in item.realm.split(",") if r.strip()}
+        if "realm" in item.model_fields_set and not _can_manage_rule({"realm": item.realm}, admin_user):
+            raise HTTPException(403, "Choose only realms managed by this administrator")
 
-            if not new_realms.issubset(set(allowed)):
-                item.realm = existing["realm"]
-
+    await _validate_group(item.assign_to_group, admin_user)
     rule = await rule_update(
         rule_id,
+        clear_group="assign_to_group" in item.model_fields_set and item.assign_to_group is None,
         name=item.name,
         attribute_name=item.attribute_name,
         attribute_condition=item.attribute_condition,
@@ -260,9 +284,7 @@ async def delete_rule_endpoint(
         if not (existing := await rule_get(rule_id)):
             return JSONResponse(content={"error": "Rule not found"}, status_code=404)
 
-        allowed = _get_admin_allowed_realms(admin_user)
-
-        if not _rule_realm_overlaps(existing.get("realm"), allowed):
+        if not _can_manage_rule(existing, admin_user):
             log.warning(f"Admin {admin_user['user_id']} denied delete access to rule {rule_id} (realm mismatch)")
             return JSONResponse(content={"error": "Not authorized"}, status_code=403)
 
@@ -391,3 +413,45 @@ async def delete_attribute(
         return JSONResponse(content={"error": "Attribute not found"}, status_code=404)
 
     return JSONResponse(content={"result": {"status": "OK"}})
+
+
+@router.post("/admin/rules/{rule_id}/match", include_in_schema=False)
+async def match_rule(rule_id: int, item: MatchRuleRequest,
+                     admin_user: dict = Depends(get_current_admin_user)):
+    rule = await rule_get(rule_id)
+    if not rule:
+        raise HTTPException(404, "Rule not found")
+    if not admin_user["bofh"] and not _rule_realm_overlaps(rule.get("realm"), _get_admin_allowed_realms(admin_user)):
+        raise HTTPException(403, "Not authorized")
+    values = claim_values({"value": item.value}, "value")
+    return {"matched": any(match_condition(rule["attribute_condition"], v, rule["attribute_value"]) for v in values)}
+
+
+@router.post("/admin/rules/simulate", include_in_schema=False)
+async def simulate_provisioning(item: SimulateProvisioningRequest,
+                                admin_user: dict = Depends(get_current_admin_user)):
+    if not admin_user["bofh"] and item.realm not in _get_admin_allowed_realms(admin_user):
+        raise HTTPException(403, "Choose a realm managed by this administrator")
+    rules = await rule_get_all(realm=item.realm)
+    claims = dict(item.attributes)
+    username = item.username or claims.get("preferred_username", "")
+    if not isinstance(username, str):
+        raise HTTPException(400, "Login username must be a single text value")
+    if item.username and "preferred_username" in claims and claims["preferred_username"] != item.username:
+        raise HTTPException(400, "Login username and preferred_username must agree")
+    if username:
+        claims.setdefault("preferred_username", username)
+    user = {"realm": item.realm, "username": username,
+            "manually_activated": item.override == "activated",
+            "manually_deactivated": item.override == "deactivated"}
+    result = evaluate_provisioning(rules, claims, user)
+    group = result["actions"].get("group")
+    group_name = None
+    if group:
+        try:
+            data = await group_get(int(group), realm="*", user_id=admin_user["user_id"])
+            group_name = data.get("name") if data else None
+        except (ValueError, TypeError):
+            pass
+    result["summary"] = summarize_provisioning(result["actions"], user, item.has_group, group_name)
+    return result

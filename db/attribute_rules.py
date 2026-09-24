@@ -15,9 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-
 from utils.usage import record
+from utils.provisioning import evaluate_provisioning, claim_values as _get_claim_values, match_condition as _match_condition
 from typing import Optional
 
 from sqlalchemy import select
@@ -120,8 +119,9 @@ async def rule_update(
     owner_domains: Optional[str] = None,
     enabled: Optional[bool] = None,
     user_id: Optional[str] = None,
+    clear_group: bool = False,
 ) -> Optional[dict]:
-    """Update an existing attribute rule."""
+    """Update an existing attribute rule; explicit null can clear a group."""
 
     async with get_async_session() as session:
         result = await session.execute(
@@ -149,7 +149,7 @@ async def rule_update(
             rule.admin = admin
         if deny is not None:
             rule.deny = deny
-        if assign_to_group is not None:
+        if assign_to_group is not None or clear_group:
             rule.assign_to_group = assign_to_group
         if owner_domains is not None:
             rule.owner_domains = owner_domains
@@ -175,163 +175,19 @@ async def rule_delete(rule_id: int, user_id: Optional[str] = None) -> bool:
         return True
 
 
-def _match_condition(
-    condition: AttributeConditionEnum, claim_value: str, rule_value: str
-) -> bool:
-    """Evaluate a single condition against a claim value."""
-
-    match condition:
-        case AttributeConditionEnum.EQUALS:
-            return claim_value == rule_value
-        case AttributeConditionEnum.NOT_EQUALS:
-            return claim_value != rule_value
-        case AttributeConditionEnum.CONTAINS:
-            return rule_value in claim_value
-        case AttributeConditionEnum.NOT_CONTAINS:
-            return rule_value not in claim_value
-        case AttributeConditionEnum.STARTS_WITH:
-            return claim_value.startswith(rule_value)
-        case AttributeConditionEnum.ENDS_WITH:
-            return claim_value.endswith(rule_value)
-        case AttributeConditionEnum.REGEX_MATCH:
-            try:
-                return bool(re.search(rule_value, claim_value))
-            except re.error:
-                log.warning(f"Invalid regex in attribute rule: {rule_value}")
-                return False
-        case _:
-            return False
-
-
-def _get_claim_values(decoded_jwt: dict, attribute_name: str) -> list[str]:
-    """
-    Extract claim values from a decoded JWT.
-    Handles both single-value and multi-value (list) claims.
-    """
-
-    value = decoded_jwt.get(attribute_name)
-
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(v) for v in value]
-    return [str(value)]
-
-
 async def evaluate_rules(decoded_jwt: dict, user: dict) -> dict:
-    """
-    Evaluate all enabled attribute rules against a decoded JWT token.
-    Returns a dict of actions to apply to the user.
-
-    Parameters:
-        decoded_jwt: The decoded JWT payload with all claims.
-        user: The user dict from user_create.
-
-    Returns:
-        dict with keys: activate, admin, deny, groups
-    """
-
-    realm = user.get("realm", "")
-    username = user.get("username", "")
-    user_id = user.get("user_id", "")
-
-    # If the user was manually deactivated or activated, skip all auto-provisioning
-    if user.get("manually_deactivated", False):
-        log.info(
-            f"Skipping rule evaluation for user {user_id}: manually deactivated."
-        )
+    """Use the same pure evaluator as simulation; count real matches only."""
+    if user.get("manually_deactivated"):
         return {}
-
-    manually_activated = user.get("manually_activated", False)
-
-    # Enrich the JWT with derived attributes so that rules can match on
-    # synthetic fields (e.g. "domain") the same way test_rules does.
-    domain = username.split("@")[-1] if "@" in username else ""
-    enriched_jwt = {**decoded_jwt}
-    enriched_jwt.setdefault("domain", domain)
-    enriched_jwt.setdefault("realm", realm)
-
-    actions = {
-        "activate": False,
-        "admin": False,
-        "deny": False,
-        "group": None,
-    }
-
     async with get_async_session() as session:
-        result = await session.execute(
-            select(AttributeRule)
-            .where(AttributeRule.enabled == True)  # noqa: E712
-            .order_by(AttributeRule.id)
-        )
-        rules = result.scalars().all()
-
-        for rule in rules:
-            log.info(
-                f"Evaluating rule '{rule.name}' (id={rule.id}): "
-                f"attribute={rule.attribute_name}, condition={rule.attribute_condition.value}, "
-                f"value='{rule.attribute_value}', realm='{rule.realm}', "
-                f"user_realm='{realm}'."
-            )
-
-            # Check realm scope
-            if rule.realm:
-                rule_realms = [r.strip() for r in rule.realm.split(",") if r.strip()]
-                if rule_realms and realm not in rule_realms:
-                    log.info(f"Rule '{rule.name}' skipped: realm mismatch ({realm} not in {rule_realms}).")
-                    continue
-
-            claim_values = _get_claim_values(enriched_jwt, rule.attribute_name)
-
-            if not claim_values:
-                log.info(f"Rule '{rule.name}' skipped: no claim values for '{rule.attribute_name}'.")
-                continue
-
-            matched = any(
-                _match_condition(rule.attribute_condition, cv, rule.attribute_value)
-                for cv in claim_values
-            )
-
-            if not matched:
-                log.info(
-                    f"Rule '{rule.name}' skipped: condition not met "
-                    f"(claim_values={claim_values}, expected '{rule.attribute_value}')."
-                )
-                continue
-
+        rows = await session.execute(select(AttributeRule).where(AttributeRule.enabled == True).order_by(AttributeRule.id))
+        rules = [r.as_dict() for r in rows.scalars().all()]
+    result = evaluate_provisioning(rules, decoded_jwt, user)
+    for match in result["rules"]:
+        if match["matched"]:
             record("provision.matched")
-            rule_actions = []
-            if rule.deny and not manually_activated:
-                actions["deny"] = True
-                rule_actions.append("deny")
-            elif rule.deny and manually_activated:
-                log.info(
-                    f"Ignoring deny rule '{rule.name}' for user {user_id}: manually activated."
-                )
-
-            if rule.activate:
-                actions["activate"] = True
-                rule_actions.append("activate")
-
-            if rule.admin:
-                actions["admin"] = True
-                rule_actions.append("grant admin")
-
-            if rule.assign_to_group and not manually_activated:
-                actions["group"] = rule.assign_to_group
-                rule_actions.append(f"assign to group {rule.assign_to_group}")
-            elif rule.assign_to_group and manually_activated:
-                log.info(
-                    f"Ignoring group assignment rule '{rule.name}' for user {user_id}: manually activated."
-                )
-
-            log.info(
-                f"Rule '{rule.name}' matched for user {user_id}: "
-                f"{rule.attribute_name} {rule.attribute_condition.value} "
-                f"'{rule.attribute_value}' -> {', '.join(rule_actions)}."
-            )
-
-    return actions
+            log.info("Provisioning rule %s matched", match["id"])
+    return result["actions"]
 
 
 async def apply_rule_actions(actions: dict, user: dict) -> None:

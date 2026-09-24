@@ -15,8 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Optional, Literal
 
 
 class TranscriptionStatusPut(BaseModel):
@@ -187,3 +187,15 @@ class CreateFeedbackRequest(BaseModel):
 class UpdateFeedbackRequest(BaseModel):
     status: Optional[str] = None
     admin_note: Optional[str] = None
+
+
+class MatchRuleRequest(BaseModel):
+    value: str | list[str]
+
+
+class SimulateProvisioningRequest(BaseModel):
+    realm: str = Field(min_length=1)
+    username: str = ""
+    attributes: dict[str, str | list[str]] = Field(default_factory=dict)
+    override: Literal["none", "activated", "deactivated"] = "none"
+    has_group: bool = False

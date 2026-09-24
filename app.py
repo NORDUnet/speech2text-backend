@@ -126,7 +126,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.add_middleware(SessionMiddleware, settings.API_SECRET_KEY, https_only=False)
+# Keep OIDC state separate from NiceGUI's browser session on the same host.
+app.add_middleware(
+    SessionMiddleware, settings.API_SECRET_KEY,
+    session_cookie="scribe_auth_session", https_only=False,
+)
 
 
 @app.on_event("startup")
