@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from fastapi import APIRouter, UploadFile, Request, Depends, Query, File
+from fastapi import HTTPException, APIRouter, UploadFile, Request, Depends, Query, File
 from fastapi.responses import JSONResponse
 from db.job import (
     job_create,
@@ -47,6 +47,8 @@ from utils.crypto import (
     FileTooLargeError,
 )
 from utils.log import get_logger
+from utils.media_duration import probe_duration
+from db.quota import needs_duration, MediaDurationRequired
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
 
 router = APIRouter(tags=["transcriber"])
@@ -348,6 +350,14 @@ async def update_transcription_status(
         JSONResponse: The updated job status.
     """
 
+    existing_job = await job_get(job_id, user["user_id"])
+    if not existing_job:
+        raise HTTPException(404, "Job not found")
+    if existing_job["status"] in (JobStatusEnum.PENDING, JobStatusEnum.IN_PROGRESS):
+        return JSONResponse(content={"result": existing_job})
+    if existing_job["status"] not in (JobStatusEnum.UPLOADED, JobStatusEnum.FAILED):
+        raise HTTPException(409, "Only uploaded jobs can be submitted")
+
     quota_left = await user_get_quota_left(user["user_id"])
 
     if not quota_left:
@@ -361,18 +371,34 @@ async def update_transcription_status(
             status_code=403,
         )
 
-    if not (
-        job := await job_update(
+    media_path = Path(api_file_storage_dir) / user["user_id"] / job_id
+    duration_seconds = (
+        await probe_duration(media_path)
+        if await needs_duration(job_id, user["user_id"]) else None
+    )
+
+    async def submit():
+        return await job_update(
             job_id,
             user_id=user["user_id"],
             language=item.language,
             model_type="Slower transcription (higher accuracy)",
             speakers=item.speakers,
             status="pending",
+            duration_seconds=duration_seconds,
             output_format=item.output_format,
             error=None,
         )
-    ):
+
+    try:
+        job = await submit()
+    except MediaDurationRequired:
+        # A BOFH assigned a pool after preflight. The failed admission rolled
+        # back; probe outside the transaction and recheck on the next attempt.
+        duration_seconds = await probe_duration(media_path)
+        job = await submit()
+
+    if not job:
         return JSONResponse(
             content={"result": {"error": "Job not found"}}, status_code=404
         )

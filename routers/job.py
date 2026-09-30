@@ -32,7 +32,6 @@ from db.user import (
     user_get_from_job,
     user_get_private_key,
     user_get_public_key,
-    user_update,
     user_get_notifications,
 )
 from db.models import JobStatusEnum
@@ -94,15 +93,6 @@ async def update_transcription_status(
         )
 
     if job["status"] == JobStatusEnum.COMPLETED:
-        if not await user_update(
-            user_id,
-            transcribed_seconds=item.transcribed_seconds,
-            active=None,
-        ):
-            return JSONResponse(
-                content={"result": {"error": "User not found"}}, status_code=404
-            )
-
         if email := await user_get_notifications(user_id, "job"):
             notifications.send_transcription_finished(email)
     elif job["status"] == JobStatusEnum.FAILED:
@@ -325,11 +315,8 @@ async def put_transcription_result(
                 content={"result": {"error": "Unsupported format"}}, status_code=400
             )
 
-    job = await job_update(
-        job_id,
-        status=JobStatusEnum.COMPLETED,
-        error=None,
-    )
+    # Workers may upload several result formats. Only their final status callback
+    # completes the job and settles usage, after every result upload succeeds.
 
     return JSONResponse(
         content={

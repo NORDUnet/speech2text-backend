@@ -21,7 +21,7 @@ from typing import List, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel
-from sqlalchemy import Index
+from sqlalchemy import Index, CheckConstraint, BigInteger
 from sqlalchemy.types import Enum as SQLAlchemyEnum
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -323,6 +323,69 @@ class Job(SQLModel, table=True):
             "error": self.error,
             "transcribed_seconds": self.transcribed_seconds,
         }
+
+
+class QuotaConfigurationLock(SQLModel, table=True):
+    __tablename__ = "quota_configuration_lock"
+    id: int = Field(primary_key=True)
+
+
+class QuotaPool(SQLModel, table=True):
+    __tablename__ = "quota_pools"
+    __table_args__ = (CheckConstraint("quota_seconds IS NULL OR quota_seconds >= 0"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    quota_seconds: Optional[int] = Field(default=None, sa_type=BigInteger)
+
+
+class QuotaRealm(SQLModel, table=True):
+    __tablename__ = "quota_realms"
+
+    # A realm has at most one pool. Keep unassigned rows to serialize reassignment.
+    realm: str = Field(primary_key=True)
+    quota_id: Optional[int] = Field(default=None, foreign_key="quota_pools.id", index=True)
+
+
+class QuotaUsage(SQLModel, table=True):
+    __tablename__ = "quota_usage"
+    __table_args__ = (
+        CheckConstraint("used_seconds >= 0"),
+        CheckConstraint("reserved_seconds >= 0"),
+    )
+
+    quota_id: int = Field(foreign_key="quota_pools.id", primary_key=True)
+    period_start: datetime = Field(primary_key=True)
+    quota_seconds: Optional[int] = Field(default=None, sa_type=BigInteger)
+    used_seconds: int = Field(default=0, sa_type=BigInteger)
+    reserved_seconds: int = Field(default=0, sa_type=BigInteger)
+
+
+class QuotaExemption(SQLModel, table=True):
+    """Immutable no-pool assignment; no duration or reservation accounting."""
+
+    __tablename__ = "quota_exemptions"
+    job_id: str = Field(primary_key=True)
+
+
+class QuotaCharge(SQLModel, table=True):
+    """Durable accounting, independent of job/user retention and realm changes."""
+
+    __tablename__ = "quota_charges"
+    __table_args__ = (
+        Index("ix_quota_charges_pool_period", "quota_id", "period_start"),
+        Index("ix_quota_charges_realm_period", "realm", "period_start", "quota_id"),
+        CheckConstraint("duration_seconds > 0"),
+        CheckConstraint("state IN ('reserved', 'completed', 'released')"),
+    )
+
+    job_id: str = Field(primary_key=True)
+    realm: str = Field(index=True)
+    quota_id: Optional[int] = Field(default=None, foreign_key="quota_pools.id")
+    submitted_at: datetime
+    period_start: datetime
+    duration_seconds: int
+    state: str = "reserved"
 
 
 class Jobs(BaseModel):
