@@ -5,6 +5,7 @@ RUN apt-get update && \
 	apt-get install -y --no-install-recommends \
 		gcc \
 		git \
+		ffmpeg \
 		python3-dev \
 		libpq-dev \
 		make && \
