@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     API_CLIENT_VERIFICATION_HEADER: str = "x-client-legacy"
     API_PRIVATE_KEY_PASSWORD: str = ""
 
+    FFPROBE_PATH: str = "ffprobe"
+
     # SMTP configuration.
     API_SMTP_HOST: str = ""
     API_SMTP_PORT: int = 25
