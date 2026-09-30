@@ -56,6 +56,7 @@ from routers.external import router as external_router
 from routers.feedback import router as feedback_router
 from routers.healthcheck import router as healthcheck_router
 from routers.job import router as job_router
+from routers.quotas import router as quotas_router
 from routers.rules import router as rules_router
 from routers.transcriber import router as transcriber_router
 from routers.user import router as user_router
@@ -234,6 +235,7 @@ app.include_router(admin_router, prefix=settings.API_PREFIX, tags=["admin"])
 app.include_router(analytics_router, prefix=settings.API_PREFIX, tags=["admin"])
 app.include_router(announcements_router, prefix=settings.API_PREFIX, tags=["admin"])
 app.include_router(customers_router, prefix=settings.API_PREFIX, tags=["admin"])
+app.include_router(quotas_router, prefix=settings.API_PREFIX, tags=["admin"])
 app.include_router(rules_router, prefix=settings.API_PREFIX, tags=["admin"])
 app.include_router(feedback_router, prefix=settings.API_PREFIX, tags=["feedback"])
 
