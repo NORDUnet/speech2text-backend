@@ -15,9 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from fastapi import HTTPException, APIRouter, UploadFile, Request, Depends, Query, File, Header
 from utils.usage import record, size_metric
 from uuid import UUID
-from fastapi import APIRouter, UploadFile, Request, Depends, Query, File, Header
 from fastapi.responses import JSONResponse
 from db.job import (
     job_create,
@@ -50,6 +50,8 @@ from utils.crypto import (
     FileTooLargeError,
 )
 from utils.log import get_logger
+from utils.media_duration import probe_duration
+from db.quota import needs_duration, MediaDurationRequired
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
 
 router = APIRouter(tags=["transcriber"])
@@ -402,19 +404,43 @@ async def update_transcription_status(
             status_code=403,
         )
 
-    if not (
-        job := await job_update(
+    media_path = Path(api_file_storage_dir) / user["user_id"] / job_id
+    duration_seconds = (
+        await probe_duration(media_path)
+        if await needs_duration(job_id, user["user_id"]) else None
+    )
+
+    async def submit():
+        return await job_update(
             job_id,
             user_id=user["user_id"],
             language=item.language,
             model_type="Slower transcription (higher accuracy)",
             speakers=item.speakers,
             status="pending",
+            duration_seconds=duration_seconds,
             output_format=item.output_format,
             error=None,
             expected_status=JobStatusEnum.UPLOADED,
         )
-    ):
+
+    try:
+        try:
+            job = await submit()
+        except MediaDurationRequired:
+            # A BOFH assigned a pool after preflight. The failed admission rolled
+            # back; probe outside the transaction and recheck on the next attempt.
+            duration_seconds = await probe_duration(media_path)
+            job = await submit()
+    except HTTPException as error:
+        if error.status_code == 403 and x_upload_id is not None:
+            detail = error.detail
+            reason = detail.get('message') if isinstance(detail, dict) else str(detail)
+            await fail_unqueued_upload(user['user_id'], x_upload_id.hex,
+                                      reason or 'Transcription quota exceeded. Contact your administrator.')
+        raise
+
+    if not job:
         return JSONResponse(
             content={"result": {"error": "Job not found"}}, status_code=404
         )

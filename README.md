@@ -169,3 +169,84 @@ scribe-backend/
 ├── utils/              # Utilities (crypto, logging, settings)
 └── tests/              # Test files
 ```
+
+## Shared monthly realm quotas
+
+BOFH users manage shared pools at **Admin → Shared quotas**. Each realm can belong
+to at most one pool. Limits are configured in hours in the UI; the API and database
+use integer seconds. `quota_seconds: null` means unlimited; `0` prevents new
+reservations. An unassigned realm has no shared-pool restriction. Existing group
+quotas still apply. REACH/external jobs are excluded from both reservation and
+completed usage, based on their server-created external job ID.
+
+`GET /api/v1/admin/quotas` returns the current UTC month, limit, completed,
+reserved, and remaining seconds. Realm admins can read the aggregate totals of
+pools associated with their managed realms (including retained current-month
+charges after a realm move). BOFH can read all pools and use `POST /admin/quotas`
+and `PUT /admin/quotas/{id}` to set a name, `quota_seconds`, and a `realms` list.
+The API rejects assigning a realm that already belongs to another pool. Remove it
+from the old pool first. Setting an empty realm list retires a pool for new jobs
+without deleting its accounting history.
+
+Each submitted non-external job is assigned once to its realm's current pool and
+the UTC month in which it is first successfully queued. Membership changes apply
+to subsequent submissions, including when a realm is first assigned to a pool;
+existing jobs and usage are not transferred. Jobs already queued/completed before
+this feature is deployed are not retroactively charged. Failed admission does not
+pin a job to a month or pool. A retry after an admitted job fails retains its
+original assignment. Editing a limit changes the current month's allowance and
+the default for future months; previous months retain their allowance. Reducing a
+limit does not cancel admitted work, even if completed plus reserved usage already
+exceeds the new limit.
+
+For a realm without a pool, admission skips media probing and reservation
+accounting. A small `quota_exemptions` record remembers that assignment, so a later
+pool assignment cannot charge the job or its retries retroactively. Membership is
+rechecked under lock at admission. If a pool was assigned after the initial check,
+the request probes outside the transaction and retries admission with the duration.
+Assigned pools still track duration even when their limit is unlimited.
+
+For jobs assigned to a pool, admission probes the encrypted upload before queueing.
+It rounds the full media
+duration up to whole seconds, then reserves capacity and changes job status in
+one short database transaction. Completion moves that reservation to completed
+usage exactly once; worker-reported speech duration continues to feed existing
+user statistics. Failed jobs and cancelled queued jobs release reservations.
+Completed usage survives job deletion and retention cleanup. Running jobs cannot
+be deleted, and cleanup skips queued/running jobs. Reservations do not expire on
+a timer: a disconnected worker might still be running. For an abandoned job,
+verify that its worker has stopped before reporting failure through the existing
+worker status endpoint; this releases its reservation.
+
+Deployment:
+
+1. Install `ffprobe` on backend hosts (included through `ffmpeg` in the Dockerfile).
+   `FFPROBE_PATH` defaults to `ffprobe` and can specify an absolute executable path.
+2. Provision `UPLOAD_TMP_DIR` with sufficient scratch capacity. Duration probing
+   decrypts into a private, unlinked temporary file to support seekable media
+   formats. The descriptor is closed on success or failure. Probes run outside
+   database transactions, with at most two probes per API process; the ffprobe
+   subprocess has a 60-second timeout.
+3. Apply `alembic upgrade head` before rolling out the backend and UI. Migration
+   `f2a4c6e8b0d1` adds the quota tables; `a4d6e8f0b2c3` adds the no-quota assignment
+   markers. Both leave existing jobs untouched. No quota is
+   enabled automatically. Create pools and assign realms in the BOFH UI.
+
+Counters are indexed by `(quota_id, period_start)`. Admission, completion, and
+limit edits serialize briefly on the pool row; different pools do not share that
+lock. Durable `quota_charges` records preserve attribution after job cleanup and
+allow counters to be audited. No job-table aggregation is needed during admission
+or ordinary quota dashboard reads.
+
+Run the isolated tests from the workspace root with `QUOTA_TEST_DATABASE_URL`
+set to an empty, disposable PostgreSQL database using a `postgresql+asyncpg://` URL:
+
+```sh
+OIDC_SCOPE=openid API_FILE_STORAGE_DIR=/tmp transcribe-backend/.venv/bin/python -m pytest \
+  transcribe-backend/tests/test_quotas.py transcribe-backend/tests/test_media_duration.py \
+  transcribe-backend/tests/test_quota_migration.py
+```
+
+The quota and migration suites require PostgreSQL and skip when
+`QUOTA_TEST_DATABASE_URL` is unset. They create and drop their model tables;
+never point them at an application database.

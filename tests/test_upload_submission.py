@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 from sqlalchemy.dialects import postgresql
+from fastapi import HTTPException
 from db import job as jobs
 from db.models import JobStatusEnum
 from routers import transcriber as route
@@ -29,11 +30,30 @@ class SubmissionTests(unittest.IsolatedAsyncioTestCase):
         identity = uuid4()
         result = dict(uuid='job', status='pending', filename='encrypted', job_type='transcription', language='English', model_type='model', output_format='SRT')
         item = SimpleNamespace(language='English', speakers=2, output_format='SRT', encryption_password='')
-        with patch.object(route, 'job_get', AsyncMock(return_value=dict(status='uploaded', external_id='ui-upload:' + identity.hex))), patch.object(route, 'job_update', AsyncMock(return_value=result)) as update, patch.object(route, 'user_get_quota_left', AsyncMock(return_value=100)), patch.object(route, 'user_get_private_key', AsyncMock(return_value=None)):
+        with patch.object(route, 'job_get', AsyncMock(return_value=dict(status='uploaded', external_id='ui-upload:' + identity.hex))), patch.object(route, 'job_update', AsyncMock(return_value=result)) as update, patch.object(route, 'user_get_quota_left', AsyncMock(return_value=100)), patch.object(route, 'user_get_private_key', AsyncMock(return_value=None)), patch.object(route, 'needs_duration', AsyncMock(return_value=False)):
             response = await route.update_transcription_status(None, item, 'job', identity, {'user_id': 'owner'})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(update.call_args.kwargs['expected_status'], JobStatusEnum.UPLOADED)
         self.assertEqual(update.call_args.kwargs['speakers'], 2)
+
+    async def test_quota_rejection_persists_reason_even_after_duration_retry(self):
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                identity = uuid4()
+                detail = {'code': 'quota_exceeded', 'message': 'Shared monthly quota exceeded.'}
+                rejection = HTTPException(403, detail)
+                effects = [route.MediaDurationRequired(), rejection] if retry else [rejection]
+                item = SimpleNamespace(language='English', speakers=0, output_format='TXT')
+                with patch.object(route, 'job_get', AsyncMock(return_value=dict(status='uploaded', external_id='ui-upload:' + identity.hex))), \
+                     patch.object(route, 'user_get_quota_left', AsyncMock(return_value=100)), \
+                     patch.object(route, 'needs_duration', AsyncMock(return_value=False)), \
+                     patch.object(route, 'probe_duration', AsyncMock(return_value=60)), \
+                     patch.object(route, 'job_update', AsyncMock(side_effect=effects)), \
+                     patch.object(route, 'fail_unqueued_upload', AsyncMock()) as fail:
+                    with self.assertRaises(HTTPException) as error:
+                        await route.update_transcription_status(None, item, 'job', identity, {'user_id': 'owner'})
+                self.assertEqual(error.exception.detail, detail)
+                fail.assert_awaited_once_with('owner', identity.hex, detail['message'])
 
     async def test_lock_protects_precondition_when_status_changes_after_route_read(self):
         # Simulates the state seen under the lock after another request won.

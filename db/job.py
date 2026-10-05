@@ -30,7 +30,9 @@ from db.models import (
 )
 from db.session import get_async_session, get_session
 from pathlib import Path
-from sqlalchemy import select
+from sqlalchemy import select, update, func
+from fastapi import HTTPException
+from db.quota import reserve, settle
 from typing import Optional
 from utils.log import get_logger
 from utils.settings import get_settings
@@ -230,6 +232,7 @@ async def job_update(
     error: Optional[str] = None,
     output_format: Optional[str] = None,
     transcribed_seconds: Optional[int] = 0,
+    duration_seconds: Optional[int] = None,
     expected_status: Optional[JobStatusEnum] = None,
 ) -> Optional[Job]:
     """
@@ -261,12 +264,28 @@ async def job_update(
 
         if not job:
             return None
+        previous_status = job.status
         # Compare while holding the row lock: repeated upload submissions must
         # never reset a queued, running or completed job back to pending.
         if expected_status is not None and job.status != expected_status:
             return job.as_dict()
+        if status and previous_status in (JobStatusEnum.COMPLETED, JobStatusEnum.DELETED, JobStatusEnum.FAILED):
+            if status == previous_status:
+                return job.as_dict()
+            raise HTTPException(409, "Job has already finished")
+        if status == JobStatusEnum.PENDING:
+            if previous_status in (JobStatusEnum.PENDING, JobStatusEnum.IN_PROGRESS):
+                return job.as_dict()
+            await reserve(session, job, duration_seconds)
+
+
         newly_queued = status == "pending" and job.status != "pending"
         if status:
+            await settle(session, job, status)
+            if status == JobStatusEnum.COMPLETED and previous_status != JobStatusEnum.COMPLETED:
+                await session.execute(update(User).where(User.user_id == job.user_id).values(
+                    transcribed_seconds=func.coalesce(User.transcribed_seconds, 0) + max(transcribed_seconds or 0, 0)
+                ))
             job.status = status
         if error:
             job.error = error
@@ -311,6 +330,9 @@ async def job_remove(uuid: str) -> bool:
         if not job:
             return False
 
+        if job.status == JobStatusEnum.IN_PROGRESS:
+            raise HTTPException(409, "A running job cannot be deleted until it finishes")
+
         file_path = Path(settings.API_FILE_STORAGE_DIR) / job.user_id / job.uuid
         file_path_mp4 = (
             Path(settings.API_FILE_STORAGE_DIR) / job.user_id / f"{job.uuid}.mp4"
@@ -333,6 +355,8 @@ async def job_remove(uuid: str) -> bool:
 
         if file_path_mp4_enc.exists():
             file_path_mp4_enc.unlink()
+
+        await settle(session, job, JobStatusEnum.DELETED)
 
         # Anonymize job data instead of deleting the record.
         # We keep the record for auditing and billing purposes.
@@ -412,7 +436,10 @@ def job_cleanup() -> None:
     with get_session() as session:
         # Cleanup jobs older than deletion date
         jobs_to_cleanup = (
-            session.query(Job).filter(Job.deletion_date <= datetime.now()).all()
+            session.query(Job).filter(
+                Job.deletion_date <= datetime.now(),
+                Job.status.notin_([JobStatusEnum.PENDING, JobStatusEnum.IN_PROGRESS]),
+            ).with_for_update().all()
         )
 
         # Notify about jobs that will be deleted tomorrow
@@ -513,7 +540,8 @@ def job_cleanup() -> None:
         jobs_to_delete = (
             session.query(Job)
             .filter(Job.created_at <= datetime.now() - timedelta(days=62))
-            .all()
+            .filter(Job.status.notin_([JobStatusEnum.PENDING, JobStatusEnum.IN_PROGRESS]))
+            .with_for_update().all()
         )
 
         for job in jobs_to_delete:

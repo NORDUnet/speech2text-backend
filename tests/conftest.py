@@ -20,3 +20,18 @@ from pathlib import Path
 
 # Add project root to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+# Unit tests must not start the notification module's recurring background timer.
+# Without this, importing db.job leaves pytest alive after the tests finish.
+import threading
+from unittest.mock import patch
+
+
+def pytest_sessionstart(session):
+    session._notification_timer_patch = patch.object(threading.Timer, "start")
+    session._notification_timer_patch.start()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    session._notification_timer_patch.stop()
