@@ -127,7 +127,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.add_middleware(SessionMiddleware, settings.API_SECRET_KEY, https_only=False)
+# Keep OIDC state separate from NiceGUI's browser session on the same host.
+app.add_middleware(
+    SessionMiddleware, settings.API_SECRET_KEY,
+    session_cookie="scribe_auth_session", https_only=False,
+)
 
 
 @app.on_event("startup")
@@ -614,3 +618,16 @@ def start_scheduler() -> None:
 def stop_scheduler() -> None:
     if scheduler:
         scheduler.shutdown(wait=False)
+
+
+@app.on_event("startup")
+@repeat_every(seconds=30)
+async def flush_usage_statistics():
+    from db.usage import flush
+    await flush()
+
+
+@app.on_event("shutdown")
+async def flush_final_usage_statistics():
+    from db.usage import flush
+    await flush()

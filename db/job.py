@@ -17,6 +17,7 @@
 
 import json
 
+from utils.usage import record
 from datetime import datetime, timedelta
 from db.models import (
     Job,
@@ -232,6 +233,7 @@ async def job_update(
     output_format: Optional[str] = None,
     transcribed_seconds: Optional[int] = 0,
     duration_seconds: Optional[int] = None,
+    expected_status: Optional[JobStatusEnum] = None,
 ) -> Optional[Job]:
     """
     Update a job by UUID.
@@ -263,14 +265,21 @@ async def job_update(
         if not job:
             return None
         previous_status = job.status
+        # Compare while holding the row lock: repeated upload submissions must
+        # never reset a queued, running or completed job back to pending.
+        if expected_status is not None and job.status != expected_status:
+            return job.as_dict()
+        if status and previous_status in (JobStatusEnum.COMPLETED, JobStatusEnum.DELETED, JobStatusEnum.FAILED):
+            if status == previous_status:
+                return job.as_dict()
+            raise HTTPException(409, "Job has already finished")
         if status == JobStatusEnum.PENDING:
             if previous_status in (JobStatusEnum.PENDING, JobStatusEnum.IN_PROGRESS):
                 return job.as_dict()
             await reserve(session, job, duration_seconds)
-        elif status and previous_status in (JobStatusEnum.COMPLETED, JobStatusEnum.DELETED, JobStatusEnum.FAILED):
-            if status == previous_status:
-                return job.as_dict()
-            raise HTTPException(409, "Job has already finished")
+
+
+        newly_queued = status == "pending" and job.status != "pending"
         if status:
             await settle(session, job, status)
             if status == JobStatusEnum.COMPLETED and previous_status != JobStatusEnum.COMPLETED:
@@ -293,7 +302,12 @@ async def job_update(
 
         log.info(f"Job {job.uuid} updated for user {user_id}.")
 
-        return job.as_dict()
+        updated = job.as_dict()
+    if newly_queued:
+        kind = {"txt": "transcript", "srt": "subtitles"}.get(updated["output_format"])
+        if kind:
+            record(f"queued.{kind}")
+    return updated
 
 
 async def job_remove(uuid: str) -> bool:
@@ -682,3 +696,27 @@ async def job_result_save(
         log.info(f"Job result for job {uuid} saved for user {user_id}.")
 
         return job_result.as_dict()
+
+
+async def fail_unqueued_upload(user_id: str, upload_id: str, error: str = "Upload & transcribe failed before transcription started. Upload the file again."):
+    """Never overwrite a successful queue submission, even after a lost response."""
+    async with get_async_session() as session:
+        result = await session.execute(select(Job).where(
+            Job.user_id == user_id, Job.external_id == "ui-upload:" + upload_id
+        ).with_for_update())
+        job = result.scalars().first()
+        if not job:
+            return None
+        remove_source = job.status == JobStatusEnum.UPLOADED
+        failed = job.status in (JobStatusEnum.UPLOADING, JobStatusEnum.UPLOADED)
+        if failed:
+            job.status = JobStatusEnum.FAILED
+            job.error = error
+        result = job.as_dict()
+    if remove_source:
+        # The row can no longer be queued; do not retain an unusable source file.
+        try:
+            (Path(settings.API_FILE_STORAGE_DIR) / user_id / result["uuid"]).unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove source file for failed upload")
+    return result
