@@ -49,6 +49,25 @@ def month_start(value: datetime) -> datetime:
     return value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
+async def remaining_seconds_for_user(user_id):
+    """Read this month's available shared quota; None means unlimited."""
+    period = month_start(datetime.now(UTC).replace(tzinfo=None))
+    async with get_async_session() as session:
+        row = (await session.execute(
+            select(QuotaPool.quota_seconds, QuotaUsage.used_seconds, QuotaUsage.reserved_seconds)
+            .select_from(User)
+            .join(QuotaRealm, QuotaRealm.realm == User.realm)
+            .join(QuotaPool, QuotaPool.id == QuotaRealm.quota_id)
+            .outerjoin(QuotaUsage, (QuotaUsage.quota_id == QuotaPool.id)
+                       & (QuotaUsage.period_start == period))
+            .where(User.user_id == user_id)
+        )).first()
+        if row is None or row[0] is None:
+            return None
+        limit, used, reserved = row
+        return max(0, limit - (used or 0) - (reserved or 0))
+
+
 async def insert_if_missing(session, model, values, keys):
     await session.execute(insert(model).values(**values).on_conflict_do_nothing(index_elements=keys))
 

@@ -51,7 +51,7 @@ from utils.crypto import (
 )
 from utils.log import get_logger
 from utils.media_duration import probe_duration
-from db.quota import needs_duration, MediaDurationRequired
+from db.quota import needs_duration, MediaDurationRequired, remaining_seconds_for_user
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
 
 router = APIRouter(tags=["transcriber"])
@@ -60,6 +60,17 @@ settings = get_settings()
 api_file_storage_dir = settings.API_FILE_STORAGE_DIR
 
 logger = get_logger()
+UPLOAD_QUOTA_ERROR = "Transcription quota exceeded. Contact your administrator, then upload the file again."
+
+
+@router.get("/transcriber/upload-quota")
+async def upload_quota(user: dict = Depends(get_current_user)) -> JSONResponse:
+    """Check the authenticated user's quota without accepting file contents."""
+    allowed = await user_get_quota_left(user["user_id"])
+    remaining = await remaining_seconds_for_user(user["user_id"])
+    return JSONResponse(content={"result": {"allowed": bool(allowed),
+                         "remaining_seconds": remaining,
+                         "error": "" if allowed else UPLOAD_QUOTA_ERROR}})
 
 
 @router.post("/transcriber/stream")
@@ -83,6 +94,9 @@ async def transcribe_file_stream(
             content={"result": {"error": "File exceeds maximum allowed size"}},
             status_code=413,
         )
+
+    if not await user_get_quota_left(user["user_id"]):
+        return JSONResponse(content={"result": {"error": UPLOAD_QUOTA_ERROR}}, status_code=403)
 
     user_public_key = await user_get_public_key(user["user_id"])
     user_public_key = deserialize_public_key_from_pem(user_public_key)
