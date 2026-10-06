@@ -51,7 +51,7 @@ from utils.crypto import (
 )
 from utils.log import get_logger
 from utils.media_duration import probe_duration
-from db.quota import needs_duration, MediaDurationRequired
+from db.quota import needs_duration, MediaDurationRequired, remaining_seconds_for_user
 from utils.validators import TranscriptionStatusPut, TranscriptionResultPut
 
 router = APIRouter(tags=["transcriber"])
@@ -67,7 +67,9 @@ UPLOAD_QUOTA_ERROR = "Transcription quota exceeded. Contact your administrator, 
 async def upload_quota(user: dict = Depends(get_current_user)) -> JSONResponse:
     """Check the authenticated user's quota without accepting file contents."""
     allowed = await user_get_quota_left(user["user_id"])
+    remaining = await remaining_seconds_for_user(user["user_id"])
     return JSONResponse(content={"result": {"allowed": bool(allowed),
+                         "remaining_seconds": remaining,
                          "error": "" if allowed else UPLOAD_QUOTA_ERROR}})
 
 
